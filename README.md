@@ -5,6 +5,7 @@ This project analyzes sunspot pulsations using Solar Dynamics Observatory (SDO) 
 
 ## Project Structure
 
+```bash
 ├── data
 │   ├── processed          # Processed data products and analysis outputs
 │   └── raw                # Original SDO FITS files (April 1, 2026)
@@ -13,6 +14,7 @@ This project analyzes sunspot pulsations using Solar Dynamics Observatory (SDO) 
 ├── src                    # Python scripts and helper modules for the pipeline
 ├── README.md              # Project overview and usage instructions
 └── requirements.txt       # Python dependencies for analysis and plotting
+```
 
 ## Usage
 
