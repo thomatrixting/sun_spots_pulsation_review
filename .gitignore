@@ -1,0 +1,14 @@
+data/
+*.fits
+*.fit
+*.p
+
+# Archivos de Jupyter y Python
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+
+# Entornos virtuales si decides usar uno local
+venv/
+.venv/
+EOF
