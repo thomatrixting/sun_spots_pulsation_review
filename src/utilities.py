@@ -2,6 +2,7 @@
 # Posted by Mc Missile, modified by community. See post 'Timeline' for change history
 # Retrieved 2026-05-17, License - CC BY-SA 4.0
 
+import os
 from astropy.io import fits
 import numpy as np
 
@@ -41,5 +42,8 @@ def make_cube(pattern, output_path, overwrite=False):
 
     # Write the cube to a new FITS file
     # output_verify='silentfix' silently fixes non-standard header values (e.g. string 'nan' in CRDER/CSYSER cards)
+    if not overwrite and os.path.exists(output_path):
+        print(f"Omiting execution: file already created at {output_path}")
+        return
     hdu_new = fits.PrimaryHDU(cube, header=header)
     hdu_new.writeto(output_path, overwrite=overwrite, output_verify='silentfix')
