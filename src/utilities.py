@@ -70,27 +70,47 @@ def ds9_box_to_hpc(x_c_ds9, y_c_ds9, w_px, h_px, hmi_map):
     return hmi_map.wcs.pixel_to_world(x_bl, y_bl), hmi_map.wcs.pixel_to_world(x_tr, y_tr)
 
 
-def plot_regions_on_map(hmi_map_rot, regions):
+def plot_regions_on_map(hmi_map_rot, regions, cmap=None, norm=None):
     """
     Draw a list of HPC box regions as labelled quadrangles on a rotated HMI map.
+
+    Works for both continuum and magnetogram maps:
+    - Continuum (BUNIT != Gauss): gray colormap with percentile clipping
+    - Magnetogram (BUNIT == Gauss): RdBu_r colormap with ±500 G symmetric norm
 
     Parameters:
     - hmi_map_rot: North-up sunpy.map.Map (already rotated)
     - regions: list of (bottom_left, top_right) SkyCoord pairs
+    - cmap: override colormap (auto-detected if None)
+    - norm: override matplotlib norm (auto-detected if None)
     """
     import matplotlib.pyplot as plt
     import astropy.units as u
 
+    is_magnetogram = 'gauss' in hmi_map_rot.meta.get('bunit', '').lower()
+
+    if cmap is None:
+        cmap = 'RdBu_r' if is_magnetogram else 'gray'
+    if norm is None and is_magnetogram:
+        norm = plt.Normalize(vmin=-500, vmax=500)
+
+    title = 'HMI Magnetogram — todas las regiones' if is_magnetogram else 'HMI Continuo — todas las regiones'
+
     colors = ['red', 'cyan', 'yellow', 'lime', 'magenta', 'orange', 'deepskyblue', 'white']
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection=hmi_map_rot)
-    hmi_map_rot.plot(axes=ax, cmap='gray', clip_interval=(1, 99.9) * u.percent)
+
+    if norm is not None:
+        hmi_map_rot.plot(axes=ax, cmap=cmap, norm=norm)
+    else:
+        hmi_map_rot.plot(axes=ax, cmap=cmap, clip_interval=(1, 99.9) * u.percent)
+
     hmi_map_rot.draw_grid(axes=ax, color='white', alpha=0.3, lw=0.5)
     for i, (bl, tr) in enumerate(regions):
         hmi_map_rot.draw_quadrangle(bl, top_right=tr,
                                     edgecolor=colors[i % len(colors)],
                                     linewidth=2, label=f'Region {i + 1}')
     ax.legend(loc='upper right', fontsize=8)
-    ax.set_title('HMI Continuo — todas las regiones')
+    ax.set_title(title)
     plt.tight_layout()
     plt.show()
