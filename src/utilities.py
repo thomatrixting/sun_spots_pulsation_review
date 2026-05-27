@@ -35,6 +35,9 @@ def make_cube(pattern, output_path, overwrite=False):
     # Initialize an empty cube
     cube = np.zeros((len(file_list), *data_shape))
 
+    if not overwrite and os.path.exists(output_path):
+        print(f"Omiting execution: file already created at {output_path}")
+        return
     # Fill the cube with data from each file
     for i, file in enumerate(file_list):
         with fits.open(file) as hdu:
@@ -42,9 +45,6 @@ def make_cube(pattern, output_path, overwrite=False):
 
     # Write the cube to a new FITS file
     # output_verify='silentfix' silently fixes non-standard header values (e.g. string 'nan' in CRDER/CSYSER cards)
-    if not overwrite and os.path.exists(output_path):
-        print(f"Omiting execution: file already created at {output_path}")
-        return
     hdu_new = fits.PrimaryHDU(cube, header=header)
     hdu_new.writeto(output_path, overwrite=overwrite, output_verify='silentfix')
 
