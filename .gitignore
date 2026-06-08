@@ -1,4 +1,6 @@
 data/
+.claude
+*test*
 *.fits
 *.fit
 *.p
