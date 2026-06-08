@@ -3,15 +3,21 @@ Sunspot pulsation analysis utilities.
 
 Typical workflow
 ----------------
-0. verify_cadence(ds_dir)                           # confirm 720 s cadence from .sav
-1. data = load_and_mask(ds_dir)                     # load cubes + build masks
-2. plot_calibration_frame(data)                     # visual check, adjust thresholds if needed
-3. metrics = compute_metrics(data)                  # mean B / Doppler per region over time
-4. save_metrics_csv(data, metrics, processed_dir)   # save time-series as CSV
-5. plot_time_series(data, metrics)                  # value-vs-time panels
-6. plot_ffts_separate(data, metrics)                # 2×2 FFT subplots
-7. plot_ffts_combined(data, metrics, xlim=(0, 0.1)) # overlaid with x-zoom
-8. save_animation(data, metrics, save_path)         # HTML animation
+0. verify_cadence(ds_dir)                               # confirm 720 s cadence from .sav
+1. data = load_and_mask(ds_dir)                         # load cubes + build masks
+2. plot_calibration_frame(data)                         # visual check, adjust thresholds if needed
+2b. plot_magnetogram(data)                              # raw magnetogram frame (default)
+    plot_magnetogram(data, histogram=True)              # B-value histogram to pick mag_filter threshold
+2c. plot_magnetogram_masks(data)                        # magnetogram + region overlays + colorbar
+   # optionally reload with mag_filter to define a hot_spot region:
+   # data = load_and_mask(ds_dir, mag_filter=lambda b: b > 500)
+3. metrics = compute_metrics(data)                      # mean B / Doppler per region over time
+4. save_metrics_csv(data, metrics, processed_dir)       # save time-series as CSV
+5. plot_time_series(data, metrics)                      # value-vs-time panels
+5b. plot_area(data, metrics)                            # area vs time
+6. plot_ffts_separate(data, metrics)                    # 2×2 FFT subplots
+7. plot_ffts_combined(data, metrics, xlim=(0, 0.1))     # overlaid with x-zoom
+8. save_animation(data, metrics, save_path)             # HTML animation
 """
 
 from __future__ import annotations
@@ -149,7 +155,8 @@ def load_and_mask(
     fill: float = 1e6,
     cluster_mode: str = 'largest',
     cadence_s: float = 720.0,
-    filter_mask: bool = True
+    filter_mask: bool = True,
+    mag_filter: 'callable | None' = None,
 ) -> dict:
     """
     Load the SDO/HMI data cubes and build region masks.
@@ -175,6 +182,11 @@ def load_and_mask(
                       as returned by verify_cadence().  In that case t=0 is
                       prepended and time_h is built via cumsum.  The median
                       cadence is stored in data['cadence_s'] for FFT use.
+    mag_filter      : optional callable applied to cube_mag to define a
+                      magnetogram-based sub-region within the sunspot footprint.
+                      Example: ``lambda b: b > 500`` creates a region where
+                      B > 500 G inside the sunspot.  The resulting mask is stored
+                      as ``data['hot_spot']``.  If None, hot_spot is None.
 
     Returns
     -------
@@ -182,6 +194,7 @@ def load_and_mask(
         cube_cont, cube_mag, cube_dop              : (n_t, ny, nx) float arrays
         cube_dop_qsun, cube_mag_qsun               : (n_t, ny_q, nx_q) float arrays
         umbra, penumbra, both                      : (n_t, ny, nx) bool arrays
+        hot_spot                                   : (n_t, ny, nx) bool array or None
         time_h                                     : (n_t,) elapsed time in hours
         n_t, cadence_s, umbra_thresh, penumbra_thresh : metadata
     """
@@ -214,10 +227,14 @@ def load_and_mask(
         umbra = umbra_raw
         penumbra = penumbra_raw
 
+    hot_spot = None
+    if mag_filter is not None:
+        hot_spot = mag_filter(cube_mag) & both
+
     return dict(
         cube_cont=cube_cont, cube_mag=cube_mag, cube_dop=cube_dop,
         cube_dop_qsun=cube_dop_qsun, cube_mag_qsun=cube_mag_qsun,
-        umbra=umbra, penumbra=penumbra, both=both,
+        umbra=umbra, penumbra=penumbra, both=both, hot_spot=hot_spot,
         time_h=time_h, n_t=n_t, cadence_s=median_cadence,
         umbra_thresh=umbra_thresh, penumbra_thresh=penumbra_thresh,
     )
@@ -263,6 +280,147 @@ def plot_calibration_frame(
     plt.show()
 
 
+def plot_magnetogram(
+    data: dict,
+    frame_idx: int | None = None,
+    histogram: bool = False,
+    save: bool = False,
+    plots_dir: str | pathlib.Path | None = None,
+) -> None:
+    """
+    Visualise the magnetogram for calibration — spatial image or value histogram.
+
+    By default (``histogram=False``) shows the raw magnetogram frame with a
+    symmetric colorbar centred at zero (99th percentile of |B|).  Pass
+    ``histogram=True`` to instead show the B-value distribution across all
+    pixel-frames inside the sunspot footprint, with percentile markers to
+    help choose a threshold for ``mag_filter``.
+
+    Parameters
+    ----------
+    data      : dict returned by load_and_mask()
+    frame_idx : frame to display in image mode; None → middle frame.
+                Ignored when histogram=True.
+    histogram : if True, show the B-value histogram instead of the spatial image
+    save      : if True, save the figure to plots_dir
+    plots_dir : directory for saved figures (required when save=True)
+    """
+    if histogram:
+        cube_mag = data['cube_mag']
+        both     = data['both']
+
+        mag_in_spot = cube_mag[both]
+        mag_in_spot = mag_in_spot[np.isfinite(mag_in_spot)]
+
+        p5, p50, p95 = np.nanpercentile(mag_in_spot, [5, 50, 95])
+        p1, p25, p75, p99 = np.nanpercentile(mag_in_spot, [1, 25, 75, 99])
+
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.hist(mag_in_spot, bins=200, color='steelblue', edgecolor='none', alpha=0.85)
+        ax.set_xlabel('Magnetic field strength  B  (G)')
+        ax.set_ylabel('Pixel count (all frames)')
+        ax.set_title(
+            f'Magnetogram distribution — sunspot interior  ({both.sum():,} pixel-frames)'
+        )
+        ax.axvline(0, color='black', lw=1.0, ls='--', label='B = 0')
+        for val, lbl, col in [(p5, '5th pct', 'orange'), (p50, 'median', 'gray'), (p95, '95th pct', 'red')]:
+            ax.axvline(val, color=col, lw=1.2, ls=':', label=f'{lbl}: {val:.0f} G')
+        ax.legend(fontsize=9)
+        plt.tight_layout()
+        _savefig(fig, plots_dir if save else None, 'magnetogram_histogram.png')
+        plt.show()
+
+        print(
+            f'min={mag_in_spot.min():.0f}  p1={p1:.0f}  p5={p5:.0f}  p25={p25:.0f}  '
+            f'median={p50:.0f}  p75={p75:.0f}  p95={p95:.0f}  p99={p99:.0f}  '
+            f'max={mag_in_spot.max():.0f} G'
+        )
+
+    else:
+        if frame_idx is None:
+            frame_idx = data['n_t'] // 2
+
+        frame = data['cube_mag'][frame_idx]
+        finite = frame[np.isfinite(frame)]
+        vmax = np.nanpercentile(np.abs(finite), 99) if finite.size else 1.0
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        im = ax.imshow(frame, cmap='bwr', origin='lower', vmin=-vmax, vmax=vmax)
+        fig.colorbar(im, ax=ax, label='B  (G)', fraction=0.046, pad=0.04)
+        ax.set_xlabel('X (px)')
+        ax.set_ylabel('Y (px)')
+        ax.set_title(f'Frame {frame_idx} — magnetogram')
+        plt.tight_layout()
+        _savefig(fig, plots_dir if save else None, f'magnetogram_{frame_idx:04d}.png')
+        plt.show()
+
+
+def plot_magnetogram_masks(
+    data: dict,
+    frame_idx: int | None = None,
+    save: bool = False,
+    plots_dir: str | pathlib.Path | None = None,
+) -> None:
+    """
+    Show one magnetogram frame with sunspot and hot_spot region overlays and a colorbar.
+
+    The colormap is centred at zero using the 99th percentile of |B| so that
+    positive (blue) and negative (red) polarities are balanced.
+
+    Parameters
+    ----------
+    data      : dict returned by load_and_mask()
+    frame_idx : frame to display; None → middle frame of the cube
+    save      : if True, save the figure to plots_dir
+    plots_dir : directory for saved figures (required when save=True)
+    """
+    if frame_idx is None:
+        frame_idx = data['n_t'] // 2
+
+    cube_mag        = data['cube_mag']
+    umbra           = data['umbra']
+    penumbra        = data['penumbra']
+    hot_spot        = data.get('hot_spot')
+    penumbra_thresh = data['penumbra_thresh']
+
+    sun_spot = umbra[frame_idx] | penumbra[frame_idx]
+
+    frame = cube_mag[frame_idx]
+    finite = frame[np.isfinite(frame)]
+    vmax = np.nanpercentile(np.abs(finite), 99) if finite.size else 1.0
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    im = ax.imshow(frame, cmap='bwr', origin='lower', vmin=-vmax, vmax=vmax)
+    fig.colorbar(im, ax=ax, label='B  (G)', fraction=0.046, pad=0.04)
+
+    ax.imshow(
+        np.where(sun_spot, 1.0, np.nan),
+        cmap='Purples', alpha=0.4, origin='lower', vmin=0, vmax=1,
+    )
+
+    legend_handles = [
+        mpatches.Patch(color='purple', alpha=0.5,
+                       label=f'Sun spot  (cont < {penumbra_thresh:,} DN)'),
+    ]
+
+    if hot_spot is not None:
+        ax.imshow(
+            np.where(hot_spot[frame_idx], 1.0, np.nan),
+            cmap='Oranges', alpha=0.55, origin='lower', vmin=0, vmax=1,
+        )
+        legend_handles.append(
+            mpatches.Patch(color='orange', alpha=0.7, label='Hot spot  (mag_filter)')
+        )
+
+    ax.set_xlabel('X (px)')
+    ax.set_ylabel('Y (px)')
+    ax.set_title(f'Frame {frame_idx} — magnetogram with region masks')
+    ax.legend(handles=legend_handles, loc='upper right')
+    plt.tight_layout()
+    _savefig(fig, plots_dir if save else None, f'magnetogram_masks_{frame_idx:04d}.png')
+    plt.show()
+
+
 # ── phase 2: analysis ─────────────────────────────────────────────────────────
 
 def compute_metrics(data: dict) -> dict:
@@ -280,7 +438,8 @@ def compute_metrics(data: dict) -> dict:
     Returns
     -------
     dict with 1-D arrays: mean_mag_{umb,pen,both,quiet}, mean_dop_{umb,pen,both,quiet},
-    area_{umb,pen,both}
+    area_{umb,pen,both}.  If ``data['hot_spot']`` is not None, also includes
+    mean_mag_hotspot, area_hotspot (magnetogram only — no Doppler for hot_spot).
     """
     cube_mag      = data['cube_mag']
     cube_dop      = data['cube_dop']
@@ -289,9 +448,10 @@ def compute_metrics(data: dict) -> dict:
     umbra         = data['umbra']
     penumbra      = data['penumbra']
     both          = data['both']
+    hot_spot      = data.get('hot_spot')
     n_qsun        = cube_mag_qsun.shape[0]
 
-    return dict(
+    result = dict(
         mean_mag_umb   = _mean_series(cube_mag, umbra),
         mean_mag_pen   = _mean_series(cube_mag, penumbra),
         mean_mag_both  = _mean_series(cube_mag, both),
@@ -304,6 +464,12 @@ def compute_metrics(data: dict) -> dict:
         area_pen       = penumbra.sum(axis=(1, 2)).astype(float),
         area_both      = both.sum(axis=(1, 2)).astype(float),
     )
+
+    if hot_spot is not None:
+        result['mean_mag_hotspot'] = _mean_series(cube_mag, hot_spot)
+        result['area_hotspot']     = hot_spot.sum(axis=(1, 2)).astype(float)
+
+    return result
 
 
 def save_metrics_csv(
@@ -333,7 +499,7 @@ def save_metrics_csv(
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / 'metrics.csv'
 
-    df = pd.DataFrame({
+    cols = {
         'time_h'        : data['time_h'],
         'area_umb'      : metrics['area_umb'],
         'area_pen'      : metrics['area_pen'],
@@ -346,7 +512,12 @@ def save_metrics_csv(
         'mean_dop_pen'  : metrics['mean_dop_pen'],
         'mean_dop_both' : metrics['mean_dop_both'],
         'mean_dop_quiet': metrics['mean_dop_quiet'],
-    })
+    }
+    if 'area_hotspot' in metrics:
+        cols['area_hotspot']     = metrics['area_hotspot']
+        cols['mean_mag_hotspot'] = metrics['mean_mag_hotspot']
+
+    df = pd.DataFrame(cols)
     df.to_csv(csv_path, index=False, float_format='%.4f')
     print(f'Metrics saved → {csv_path}  ({len(df)} rows)')
     return csv_path
@@ -393,6 +564,9 @@ def plot_time_series(
         ax1.plot(time_h, proc(mag), color=color, lw=0.8, label=name)
         ax2.plot(time_h, proc(dop), color=color, lw=0.8, label=name)
 
+    if 'mean_mag_hotspot' in metrics:
+        ax1.plot(time_h, proc(metrics['mean_mag_hotspot']), color='darkorange', lw=0.8, label='Hot spot')
+
     ax1.set_ylabel(ylabel_mag); ax1.set_title('Mean magnetogram' + suffix.replace('_', ' '))
     ax1.grid(alpha=0.3); ax1.legend()
     ax2.set_ylabel(ylabel_dop); ax2.set_xlabel('Time  (h)')
@@ -401,6 +575,42 @@ def plot_time_series(
 
     plt.tight_layout()
     _savefig(fig, plots_dir if save else None, f'time_series{suffix}.png')
+    plt.show()
+
+
+def plot_area(
+    data: dict,
+    metrics: dict,
+    save: bool = False,
+    plots_dir: str | pathlib.Path | None = None,
+) -> None:
+    """
+    Plot sunspot region area (pixel count) vs time.
+
+    Shows umbra, penumbra, both, and hot_spot (when available) in a single panel.
+
+    Parameters
+    ----------
+    data      : dict from load_and_mask()
+    metrics   : dict from compute_metrics()
+    save      : if True, save the figure to plots_dir
+    plots_dir : directory for saved figures (required when save=True)
+    """
+    time_h = data['time_h']
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(time_h, metrics['area_pen'],  color='purple', lw=0.9, label='Penumbra')
+    ax.plot(time_h, metrics['area_umb'],  color='orange', lw=0.9, label='Umbra')
+    ax.plot(time_h, metrics['area_both'], color='steelblue', lw=0.9, label='Both')
+    if 'area_hotspot' in metrics:
+        ax.plot(time_h, metrics['area_hotspot'], color='red', lw=0.9, label='Hot spot')
+    ax.set_xlabel('Time  (h)')
+    ax.set_ylabel('Area  (pixels)')
+    ax.set_title('Region area vs time')
+    ax.grid(alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    _savefig(fig, plots_dir if save else None, 'area_vs_time.png')
     plt.show()
 
 
@@ -576,18 +786,23 @@ def save_animation(
     step: int = 50,
     fps: int = 5,
     embed_limit_mb: float = 50.0,
+    mag_symmetric_cbar: bool = False,
 ) -> None:
     """
     Save a 3-channel (continuum / magnetogram / dopplergram) animation as HTML.
 
     Parameters
     ----------
-    data           : dict from load_and_mask()
-    metrics        : dict from compute_metrics()
-    save_path      : output .html file path (parent dirs created if needed)
-    step           : subsample every Nth frame to keep file size manageable
-    fps            : frames per second
-    embed_limit_mb : matplotlib animation size limit in MB
+    data               : dict from load_and_mask()
+    metrics            : dict from compute_metrics()
+    save_path          : output .html file path (parent dirs created if needed)
+    step               : subsample every Nth frame to keep file size manageable
+    fps                : frames per second
+    embed_limit_mb     : matplotlib animation size limit in MB
+    mag_symmetric_cbar : if True, use a symmetric colorbar for the magnetogram
+                         channel centred at zero (vmin = −vmax where vmax is the
+                         99th percentile of |B| across all frames).  Default False
+                         keeps the original [2nd, 98th] percentile limits.
     """
     save_path = pathlib.Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -608,6 +823,11 @@ def save_animation(
     cmaps_ch   = ['gray',           'bwr',              'RdBu_r']
     labels_ch  = ['Continuum (DN)', 'Magnetogram (G)',  'Dopplergram (m/s)']
     clims      = [np.nanpercentile(c, [2, 98]) for c in cubes_ch]
+
+    if mag_symmetric_cbar:
+        mag_finite = cube_mag[np.isfinite(cube_mag)]
+        mag_vmax = float(np.nanpercentile(np.abs(mag_finite), 99))
+        clims[1] = [-mag_vmax, mag_vmax]
 
     _LEGEND_HANDLES = [
         mpatches.Patch(color=(0.0, 0.85, 0.0, 0.75), label='Umbra'),
