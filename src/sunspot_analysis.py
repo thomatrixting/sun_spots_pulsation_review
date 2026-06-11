@@ -6,8 +6,9 @@ Typical workflow
 0. verify_cadence(ds_dir)                               # confirm 720 s cadence from .sav
 1. data = load_and_mask(ds_dir)                         # load cubes + build masks
 2. plot_calibration_frame(data)                         # visual check, adjust thresholds if needed
-2b. plot_magnetogram(data)                              # raw magnetogram frame (default)
-    plot_magnetogram(data, histogram=True)              # B-value histogram to pick mag_filter threshold
+2b. plot_histogram(data)                                 # histogram of entire cube (default: magnetogram)
+    plot_histogram(data, cube='continuum')              # continuum intensity distribution
+    plot_histogram(data, cube='dopplergram')            # Doppler velocity distribution
 2c. plot_magnetogram_masks(data)                        # magnetogram + region overlays + colorbar
    # optionally reload with mag_filter to define a hot_spot region:
    # data = load_and_mask(ds_dir, mag_filter=lambda b: b > 500)
@@ -280,79 +281,65 @@ def plot_calibration_frame(
     plt.show()
 
 
-def plot_magnetogram(
+def plot_histogram(
     data: dict,
-    frame_idx: int | None = None,
-    histogram: bool = False,
+    cube: str = 'magnetogram',
     save: bool = False,
     plots_dir: str | pathlib.Path | None = None,
 ) -> None:
     """
-    Visualise the magnetogram for calibration — spatial image or value histogram.
-
-    By default (``histogram=False``) shows the raw magnetogram frame with a
-    symmetric colorbar centred at zero (99th percentile of |B|).  Pass
-    ``histogram=True`` to instead show the B-value distribution across all
-    pixel-frames inside the sunspot footprint, with percentile markers to
-    help choose a threshold for ``mag_filter``.
+    Plot the value distribution of an entire data cube across all frames and pixels.
 
     Parameters
     ----------
     data      : dict returned by load_and_mask()
-    frame_idx : frame to display in image mode; None → middle frame.
-                Ignored when histogram=True.
-    histogram : if True, show the B-value histogram instead of the spatial image
+    cube      : which cube to histogram — 'continuum', 'magnetogram', or 'dopplergram'
     save      : if True, save the figure to plots_dir
     plots_dir : directory for saved figures (required when save=True)
     """
-    if histogram:
-        cube_mag = data['cube_mag']
-        both     = data['both']
+    _meta = {
+        'continuum':   ('cube_cont', 'Intensity (DN)',              'Continuum'),
+        'magnetogram': ('cube_mag',  'Magnetic field strength (G)', 'Magnetogram'),
+        'dopplergram': ('cube_dop',  'Doppler velocity (m/s)',       'Dopplergram'),
+    }
+    if cube not in _meta:
+        raise ValueError(f"cube must be 'continuum', 'magnetogram', or 'dopplergram', got {cube!r}")
 
-        mag_in_spot = cube_mag[both]
-        mag_in_spot = mag_in_spot[np.isfinite(mag_in_spot)]
+    data_key, xlabel, title_label = _meta[cube]
+    arr = data[data_key]
 
-        p5, p50, p95 = np.nanpercentile(mag_in_spot, [5, 50, 95])
-        p1, p25, p75, p99 = np.nanpercentile(mag_in_spot, [1, 25, 75, 99])
+    # Percentiles on the 3D array — no flat copy needed
+    p1, p5, p25, p50, p75, p95, p99 = np.nanpercentile(arr, [1, 5, 25, 50, 75, 95, 99])
+    n_finite = int(np.isfinite(arr).sum())
 
-        fig, ax = plt.subplots(figsize=(9, 4))
-        ax.hist(mag_in_spot, bins=200, color='steelblue', edgecolor='none', alpha=0.85)
-        ax.set_xlabel('Magnetic field strength  B  (G)')
-        ax.set_ylabel('Pixel count (all frames)')
-        ax.set_title(
-            f'Magnetogram distribution — sunspot interior  ({both.sum():,} pixel-frames)'
-        )
+    # Pre-compute bin counts from finite values, then discard the flat array.
+    # Passing millions of raw points to ax.hist() stalls / OOMs the kernel.
+    finite_vals = arr[np.isfinite(arr)]
+    counts, edges = np.histogram(finite_vals, bins=300)
+    vmin, vmax_val = float(edges[0]), float(edges[-1])
+    del finite_vals
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.stairs(counts, edges, fill=True, color='steelblue', alpha=0.85)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel('Pixel count (all frames)')
+    ax.set_title(f'{title_label} distribution — full cube  ({n_finite:,} pixel-frames)')
+
+    if cube == 'magnetogram':
         ax.axvline(0, color='black', lw=1.0, ls='--', label='B = 0')
-        for val, lbl, col in [(p5, '5th pct', 'orange'), (p50, 'median', 'gray'), (p95, '95th pct', 'red')]:
-            ax.axvline(val, color=col, lw=1.2, ls=':', label=f'{lbl}: {val:.0f} G')
-        ax.legend(fontsize=9)
-        plt.tight_layout()
-        _savefig(fig, plots_dir if save else None, 'magnetogram_histogram.png')
-        plt.show()
+    for val, lbl, col in [(p5, '5th pct', 'orange'), (p50, 'median', 'gray'), (p95, '95th pct', 'red')]:
+        ax.axvline(val, color=col, lw=1.2, ls=':', label=f'{lbl}: {val:.1f}')
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    _savefig(fig, plots_dir if save else None, f'histogram_{cube}.png')
+    plt.show()
 
-        print(
-            f'min={mag_in_spot.min():.0f}  p1={p1:.0f}  p5={p5:.0f}  p25={p25:.0f}  '
-            f'median={p50:.0f}  p75={p75:.0f}  p95={p95:.0f}  p99={p99:.0f}  '
-            f'max={mag_in_spot.max():.0f} G'
-        )
-
-    else:
-        if frame_idx is None:
-            frame_idx = data['n_t'] // 2
-
-        frame = data['cube_mag'][frame_idx]
-        finite = frame[np.isfinite(frame)]
-        vmax = np.nanpercentile(np.abs(finite), 99) if finite.size else 1.0
-
-        fig, ax = plt.subplots(figsize=(6, 6))
-        im = ax.imshow(frame, cmap='bwr', origin='lower', vmin=-vmax, vmax=vmax)
-        fig.colorbar(im, ax=ax, label='B  (G)', fraction=0.046, pad=0.04)
-        ax.set_xlabel('X (px)')
-        ax.set_ylabel('Y (px)')
-        ax.set_title(f'Frame {frame_idx} — magnetogram')
-        plt.tight_layout()
-        _savefig(fig, plots_dir if save else None, f'magnetogram_{frame_idx:04d}.png')
-        plt.show()
+    unit = 'G' if cube == 'magnetogram' else ('DN' if cube == 'continuum' else 'm/s')
+    print(
+        f'min={vmin:.1f}  p1={p1:.1f}  p5={p5:.1f}  p25={p25:.1f}  '
+        f'median={p50:.1f}  p75={p75:.1f}  p95={p95:.1f}  p99={p99:.1f}  '
+        f'max={vmax_val:.1f}  [{unit}]'
+    )
 
 
 def plot_magnetogram_masks(
