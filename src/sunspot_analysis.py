@@ -230,7 +230,7 @@ def load_and_mask(
 
     hot_spot = None
     if mag_filter is not None:
-        hot_spot = mag_filter(cube_mag) & both
+        hot_spot = mag_filter(cube_mag) & (umbra | penumbra)
 
     return dict(
         cube_cont=cube_cont, cube_mag=cube_mag, cube_dop=cube_dop,
@@ -283,7 +283,7 @@ def plot_calibration_frame(
 
 def plot_histogram(
     data: dict,
-    cube: str = 'magnetogram',
+    cube: str = "magnetogram",
     save: bool = False,
     plots_dir: str | pathlib.Path | None = None,
 ) -> None:
@@ -293,52 +293,114 @@ def plot_histogram(
     Parameters
     ----------
     data      : dict returned by load_and_mask()
-    cube      : which cube to histogram — 'continuum', 'magnetogram', or 'dopplergram'
-    save      : if True, save the figure to plots_dir
-    plots_dir : directory for saved figures (required when save=True)
+    cube      : 'continuum', 'magnetogram', or 'dopplergram'
+    save      : if True, save the figure
+    plots_dir : output directory when save=True
     """
+
     _meta = {
-        'continuum':   ('cube_cont', 'Intensity (DN)',              'Continuum'),
-        'magnetogram': ('cube_mag',  'Magnetic field strength (G)', 'Magnetogram'),
-        'dopplergram': ('cube_dop',  'Doppler velocity (m/s)',       'Dopplergram'),
+        "continuum": (
+            "cube_cont",
+            "Intensity (DN)",
+            "Continuum",
+            "",
+        ),
+        "magnetogram": (
+            "cube_mag",
+            "Magnetic field strength (G)",
+            "Magnetogram",
+            "G",
+        ),
+        "dopplergram": (
+            "cube_dop",
+            "Doppler velocity (m/s)",
+            "Dopplergram",
+            "m/s",
+        ),
     }
+
     if cube not in _meta:
-        raise ValueError(f"cube must be 'continuum', 'magnetogram', or 'dopplergram', got {cube!r}")
+        raise ValueError(
+            f"cube must be one of {list(_meta.keys())}, got {cube!r}"
+        )
 
-    data_key, xlabel, title_label = _meta[cube]
-    arr = data[data_key]
+    cube_key, xlabel, title_name, unit = _meta[cube]
 
-    # Percentiles on the 3D array — no flat copy needed
-    p1, p5, p25, p50, p75, p95, p99 = np.nanpercentile(arr, [1, 5, 25, 50, 75, 95, 99])
-    n_finite = int(np.isfinite(arr).sum())
+    cube_data = data[cube_key]
+    both = data["both"]
 
-    # Pre-compute bin counts from finite values, then discard the flat array.
-    # Passing millions of raw points to ax.hist() stalls / OOMs the kernel.
-    finite_vals = arr[np.isfinite(arr)]
-    counts, edges = np.histogram(finite_vals, bins=300)
-    vmin, vmax_val = float(edges[0]), float(edges[-1])
-    del finite_vals
+    values = cube_data[both]
+    values = values[np.isfinite(values)]
+
+    p1, p5, p25, p50, p75, p95, p99 = np.nanpercentile(
+        values, [1, 5, 25, 50, 75, 95, 99]
+    )
 
     fig, ax = plt.subplots(figsize=(9, 4))
-    ax.stairs(counts, edges, fill=True, color='steelblue', alpha=0.85)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel('Pixel count (all frames)')
-    ax.set_title(f'{title_label} distribution — full cube  ({n_finite:,} pixel-frames)')
 
-    if cube == 'magnetogram':
-        ax.axvline(0, color='black', lw=1.0, ls='--', label='B = 0')
-    for val, lbl, col in [(p5, '5th pct', 'orange'), (p50, 'median', 'gray'), (p95, '95th pct', 'red')]:
-        ax.axvline(val, color=col, lw=1.2, ls=':', label=f'{lbl}: {val:.1f}')
+    ax.hist(
+        values,
+        bins=200,
+        color="steelblue",
+        edgecolor="none",
+        alpha=0.85,
+    )
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Pixel count (all frames)")
+    ax.set_title(
+        f"{title_name} distribution — sunspot interior "
+        f"({both.sum():,} pixel-frames)"
+    )
+
+    # Zero line only makes sense for signed quantities
+    if cube in ("magnetogram", "dopplergram"):
+        ax.axvline(
+            0,
+            color="black",
+            lw=1.0,
+            ls="--",
+            label="0",
+        )
+
+    for val, lbl, col in [
+        (p5, "5th pct", "orange"),
+        (p50, "median", "gray"),
+        (p95, "95th pct", "red"),
+    ]:
+        suffix = f" {unit}" if unit else ""
+        ax.axvline(
+            val,
+            color=col,
+            lw=1.2,
+            ls=":",
+            label=f"{lbl}: {val:.2f}{suffix}",
+        )
+
     ax.legend(fontsize=9)
     plt.tight_layout()
-    _savefig(fig, plots_dir if save else None, f'histogram_{cube}.png')
+
+    _savefig(
+        fig,
+        plots_dir if save else None,
+        f"{title_name.lower()}_histogram.png",
+    )
+
     plt.show()
 
-    unit = 'G' if cube == 'magnetogram' else ('DN' if cube == 'continuum' else 'm/s')
+    suffix = f" {unit}" if unit else ""
+
     print(
-        f'min={vmin:.1f}  p1={p1:.1f}  p5={p5:.1f}  p25={p25:.1f}  '
-        f'median={p50:.1f}  p75={p75:.1f}  p95={p95:.1f}  p99={p99:.1f}  '
-        f'max={vmax_val:.1f}  [{unit}]'
+        f"min={values.min():.2f}"
+        f"  p1={p1:.2f}"
+        f"  p5={p5:.2f}"
+        f"  p25={p25:.2f}"
+        f"  median={p50:.2f}"
+        f"  p75={p75:.2f}"
+        f"  p95={p95:.2f}"
+        f"  p99={p99:.2f}"
+        f"  max={values.max():.2f}"
+        f"{suffix}"
     )
 
 
@@ -393,10 +455,10 @@ def plot_magnetogram_masks(
     if hot_spot is not None:
         ax.imshow(
             np.where(hot_spot[frame_idx], 1.0, np.nan),
-            cmap='Oranges', alpha=0.55, origin='lower', vmin=0, vmax=1,
+            cmap='Greens', alpha=0.55, origin='lower', vmin=0, vmax=1,
         )
         legend_handles.append(
-            mpatches.Patch(color='orange', alpha=0.7, label='Hot spot  (mag_filter)')
+            mpatches.Patch(color='green', alpha=0.7, label='Hot spot  (mag_filter)')
         )
 
     ax.set_xlabel('X (px)')
