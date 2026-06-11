@@ -835,7 +835,7 @@ def save_animation(
     step: int = 50,
     fps: int = 5,
     embed_limit_mb: float = 50.0,
-    mag_symmetric_cbar: bool = False,
+    mag_symmetric_cbar: bool = True,
 ) -> None:
     """
     Save a 3-channel (continuum / magnetogram / dopplergram) animation as HTML.
