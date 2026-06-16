@@ -48,6 +48,8 @@ def _load_cube(path: pathlib.Path, fill: float) -> np.ndarray:
 
 
 def _keep_central_cluster(binary_img: np.ndarray, mode: str) -> np.ndarray:
+    if mode not in ('largest', 'central'):
+        raise ValueError(f"cluster_mode must be 'largest' or 'central', got {mode!r}")
     labeled, n = ndimage.label(binary_img)
     if n == 0:
         return binary_img
@@ -75,10 +77,9 @@ def _fft(ts: np.ndarray, cadence_s: float) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _mean_series(cube: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    return np.array([
-        np.nanmean(cube[t][mask[t]]) if mask[t].any() else np.nan
-        for t in range(cube.shape[0])
-    ])
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        return np.nanmean(np.where(mask, cube, np.nan), axis=(1, 2))
 
 
 def _savefig(fig: plt.Figure, plots_dir: pathlib.Path | None, filename: str) -> None:
@@ -157,6 +158,7 @@ def load_and_mask(
     cluster_mode: str = 'largest',
     cadence_s: float = 720.0,
     filter_mask: bool = True,
+    filter_both: bool = False,
     mag_filter: 'callable | None' = None,
 ) -> dict:
     """
@@ -183,6 +185,11 @@ def load_and_mask(
                       as returned by verify_cadence().  In that case t=0 is
                       prepended and time_h is built via cumsum.  The median
                       cadence is stored in data['cadence_s'] for FFT use.
+    filter_both     : if True, derive ``both`` as ``umbra | penumbra`` after
+                      filtering, so it is consistent with the filtered masks.
+                      Default False preserves the original behaviour (raw
+                      continuum threshold, may include secondary sunspots).
+                      Has no effect when filter_mask=False.
     mag_filter      : optional callable applied to cube_mag to define a
                       magnetogram-based sub-region within the sunspot footprint.
                       Example: ``lambda b: b > 500`` creates a region where
@@ -219,14 +226,16 @@ def load_and_mask(
 
     umbra_raw    = (cube_cont < umbra_thresh)    & np.isfinite(cube_cont)
     penumbra_raw = (cube_cont < penumbra_thresh) & np.isfinite(cube_cont) & ~umbra_raw
-    both         = (cube_cont < penumbra_thresh) & np.isfinite(cube_cont)
 
     if filter_mask:
         umbra    = np.array([_keep_central_cluster(umbra_raw[t],    cluster_mode) for t in range(n_t)], dtype=bool)
         penumbra = np.array([_keep_central_cluster(penumbra_raw[t], cluster_mode) for t in range(n_t)], dtype=bool)
+        del umbra_raw, penumbra_raw
     else:
         umbra = umbra_raw
         penumbra = penumbra_raw
+
+    both = umbra | penumbra if filter_both else (cube_cont < penumbra_thresh) & np.isfinite(cube_cont)
 
     hot_spot = None
     if mag_filter is not None:
@@ -279,6 +288,7 @@ def plot_calibration_frame(
     plt.tight_layout()
     _savefig(fig, plots_dir if save else None, f'calibration_frame_{frame_idx:04d}.png')
     plt.show()
+    plt.close(fig)
 
 
 def plot_histogram(
@@ -387,6 +397,7 @@ def plot_histogram(
     )
 
     plt.show()
+    plt.close(fig)
 
     suffix = f" {unit}" if unit else ""
 
@@ -468,6 +479,7 @@ def plot_magnetogram_masks(
     plt.tight_layout()
     _savefig(fig, plots_dir if save else None, f'magnetogram_masks_{frame_idx:04d}.png')
     plt.show()
+    plt.close(fig)
 
 
 # ── phase 2: analysis ─────────────────────────────────────────────────────────
@@ -625,6 +637,7 @@ def plot_time_series(
     plt.tight_layout()
     _savefig(fig, plots_dir if save else None, f'time_series{suffix}.png')
     plt.show()
+    plt.close(fig)
 
 
 def plot_area(
@@ -661,6 +674,7 @@ def plot_area(
     plt.tight_layout()
     _savefig(fig, plots_dir if save else None, 'area_vs_time.png')
     plt.show()
+    plt.close(fig)
 
 
 def _fft_regions(metrics: dict, cadence_s: float) -> list[tuple[str, np.ndarray, np.ndarray, str]]:
@@ -721,6 +735,7 @@ def plot_ffts_separate(
     plt.tight_layout()
     _savefig(fig, plots_dir if save else None, 'fft_separate.png')
     plt.show()
+    plt.close(fig)
 
     _out_dir = pathlib.Path(plots_dir) if save else None
     if print_table:
@@ -778,6 +793,7 @@ def plot_ffts_combined(
     plt.tight_layout()
     _savefig(fig, plots_dir if save else None, 'fft_combined.png')
     plt.show()
+    plt.close(fig)
 
     _out_dir = pathlib.Path(plots_dir) if save else None
     if print_table:
@@ -871,11 +887,11 @@ def save_animation(
     cubes_ch   = [cube_cont,        cube_mag,           cube_dop]
     cmaps_ch   = ['gray',           'bwr',              'RdBu_r']
     labels_ch  = ['Continuum (DN)', 'Magnetogram (G)',  'Dopplergram (m/s)']
-    clims      = [np.nanpercentile(c, [2, 98]) for c in cubes_ch]
+    _sample    = np.arange(0, n_t, max(1, n_t // 50))
+    clims      = [np.nanpercentile(c[_sample], [2, 98]) for c in cubes_ch]
 
     if mag_symmetric_cbar:
-        mag_finite = cube_mag[np.isfinite(cube_mag)]
-        mag_vmax = float(np.nanpercentile(np.abs(mag_finite), 99))
+        mag_vmax = float(np.nanpercentile(np.abs(cube_mag[_sample]), 99))
         clims[1] = [-mag_vmax, mag_vmax]
 
     _LEGEND_HANDLES = [

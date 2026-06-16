@@ -37,7 +37,7 @@ def make_cube(pattern, output_path, overwrite=False):
 
     if not overwrite and os.path.exists(output_path):
         print(f"Omiting execution: file already created at {output_path}")
-        return
+        return output_path
     # Fill the cube with data from each file
     for i, file in enumerate(file_list):
         with fits.open(file) as hdu:
@@ -47,6 +47,7 @@ def make_cube(pattern, output_path, overwrite=False):
     # output_verify='silentfix' silently fixes non-standard header values (e.g. string 'nan' in CRDER/CSYSER cards)
     hdu_new = fits.PrimaryHDU(cube, header=header)
     hdu_new.writeto(output_path, overwrite=overwrite, output_verify='silentfix')
+    return output_path
 
 
 def ds9_box_to_hpc(x_c_ds9, y_c_ds9, w_px, h_px, hmi_map):
