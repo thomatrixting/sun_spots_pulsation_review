@@ -4,6 +4,7 @@ data/
 *.fits
 *.fit
 *.p
+notes.md
 
 # Archivos de Jupyter y Python
 .ipynb_checkpoints/
