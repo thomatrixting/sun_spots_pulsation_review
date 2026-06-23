@@ -26,6 +26,7 @@ from __future__ import annotations
 import datetime
 import pathlib
 import warnings
+from collections.abc import Callable
 
 import matplotlib
 import matplotlib.patches as mpatches
@@ -43,14 +44,14 @@ from scipy.signal import find_peaks
 
 def _load_cube(path: pathlib.Path, fill: float) -> np.ndarray:
     with fits.open(path) as hdul:
-        arr = hdul[0].data.astype(float)
+        arr = hdul[0].data.astype(float)  # type: ignore[union-attr]
     return np.where(np.abs(arr) > fill, np.nan, arr)
 
 
 def _keep_central_cluster(binary_img: np.ndarray, mode: str) -> np.ndarray:
     if mode not in ('largest', 'central'):
         raise ValueError(f"cluster_mode must be 'largest' or 'central', got {mode!r}")
-    labeled, n = ndimage.label(binary_img)
+    labeled, n = ndimage.label(binary_img)  # type: ignore[misc]
     if n == 0:
         return binary_img
     if mode == 'largest':
@@ -82,7 +83,7 @@ def _mean_series(cube: np.ndarray, mask: np.ndarray) -> np.ndarray:
         return np.nanmean(np.where(mask, cube, np.nan), axis=(1, 2))
 
 
-def _savefig(fig: plt.Figure, plots_dir: pathlib.Path | None, filename: str) -> None:
+def _savefig(fig: matplotlib.pyplot.figure, plots_dir: str | pathlib.Path | None, filename: str) -> None: # pyright: ignore[reportAttributeAccessIssue]
     if plots_dir is None:
         return
     plots_dir = pathlib.Path(plots_dir)
@@ -98,7 +99,7 @@ def verify_cadence(
     ds_dir: str | pathlib.Path,
     expected_s: float = 720.0,
     tol_s: float = 1.0,
-) -> float:
+) -> tuple[float, np.ndarray]:
     """
     Verify the frame cadence from the IDL .sav timing file.
 
@@ -159,7 +160,7 @@ def load_and_mask(
     cadence_s: float = 720.0,
     filter_mask: bool = True,
     filter_both: bool = False,
-    mag_filter: 'callable | None' = None,
+    mag_filter: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> dict:
     """
     Load the SDO/HMI data cubes and build region masks.
@@ -737,10 +738,10 @@ def plot_ffts_separate(
     plt.show()
     plt.close(fig)
 
-    _out_dir = pathlib.Path(plots_dir) if save else None
+    _out_dir = pathlib.Path(plots_dir) if (save and plots_dir is not None) else None
     if print_table:
         _print_peak_table(regions, _out_dir)
-    elif save:
+    elif _out_dir is not None:
         _save_peak_table_csv(regions, _out_dir)
 
 
@@ -777,7 +778,7 @@ def plot_ffts_combined(
             peaks, _ = find_peaks(amp, height=np.percentile(amp, 85), distance=5)
             top5 = peaks[np.argsort(amp[peaks])[::-1][:5]]
             for idx in sorted(top5):
-                ax.axvline(f_mhz[idx], color=color, lw=0.7, ls='--', alpha=0.5)
+                ax.axvline(float(f_mhz[idx]), color=color, lw=0.7, ls='--', alpha=0.5)
 
     ax.set_ylabel('Amplitude (arb. units)')
     ax.set_xlabel('Frequency (mHz)')
@@ -795,10 +796,10 @@ def plot_ffts_combined(
     plt.show()
     plt.close(fig)
 
-    _out_dir = pathlib.Path(plots_dir) if save else None
+    _out_dir = pathlib.Path(plots_dir) if (save and plots_dir is not None) else None
     if print_table:
         _print_peak_table(regions, _out_dir)
-    elif save:
+    elif _out_dir is not None:
         _save_peak_table_csv(regions, _out_dir)
 
 
@@ -892,7 +893,7 @@ def save_animation(
 
     if mag_symmetric_cbar:
         mag_vmax = float(np.nanpercentile(np.abs(cube_mag[_sample]), 99))
-        clims[1] = [-mag_vmax, mag_vmax]
+        clims[1] = np.array([-mag_vmax, mag_vmax])
 
     _LEGEND_HANDLES = [
         mpatches.Patch(color=(0.0, 0.85, 0.0, 0.75), label='Umbra'),
