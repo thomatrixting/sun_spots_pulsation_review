@@ -584,13 +584,14 @@ def save_metrics_csv(
         cols['mean_mag_hotspot'] = metrics['mean_mag_hotspot']
     
     if not raw_dopler:
-        cols['mean_dop_umb']  = metrics['mean_dop_umb'],
-        cols['mean_dop_pen']  = metrics['mean_dop_pen'],
-        cols['mean_dop_both'] = metrics['mean_dop_both'],
+        cols['mean_dop_umb']  = metrics['mean_dop_umb']
+        cols['mean_dop_pen']  = metrics['mean_dop_pen']
+        cols['mean_dop_both'] = metrics['mean_dop_both']
     else:
-        cols['mean_dop_umb_uncorrected']  = metrics['mean_dop_umb'],
-        cols['mean_dop_pen_uncorrected']  = metrics['mean_dop_pen'],
-        cols['mean_dop_both_uncorrected'] = metrics['mean_dop_both'],
+        cols['mean_dop_umb_uncorrected']  = metrics['mean_dop_umb']
+        cols['mean_dop_pen_uncorrected']  = metrics['mean_dop_pen']
+        cols['mean_dop_both_uncorrected'] = metrics['mean_dop_both']
+
     df = pd.DataFrame(cols)
     df.to_csv(csv_path, index=False, float_format='%.4f')
     print(f'Metrics saved → {csv_path}  ({len(df)} rows)')
@@ -603,6 +604,7 @@ def plot_time_series(
     normalized: bool = False,
     save: bool = False,
     plots_dir: str | pathlib.Path | None = None,
+    mag_residual: bool = False
 ) -> None:
     """
     Plot mean B and Doppler velocity vs time for umbra, penumbra, both, and quiet sun.
@@ -625,18 +627,29 @@ def plot_time_series(
     ylabel_mag = 'Norm. mean B'        if normalized else 'Mean B  (G)'
     ylabel_dop = 'Norm. mean velocity' if normalized else 'Mean velocity  (m/s)'
     suffix     = '_normalized'         if normalized else ''
+    suffix     += '_residual'          if mag_residual else ''
 
-    series = [
-        ('Umbra',     metrics['mean_mag_umb'],   metrics['mean_dop_umb'],   'red'),
-        ('Penumbra',  metrics['mean_mag_pen'],   metrics['mean_dop_pen'],   'blue'),
-        ('Both',      metrics['mean_mag_both'],  metrics['mean_dop_both'],  'purple'),
-        ('Quiet Sun', metrics['mean_mag_quiet'], metrics['mean_dop_quiet'], 'black'),
-    ]
+    if not mag_residual:
+        series = [
+            ('Umbra',     metrics['mean_mag_umb'],   metrics['mean_dop_umb'],   'red'),
+            ('Penumbra',  metrics['mean_mag_pen'],   metrics['mean_dop_pen'],   'blue'),
+            ('Both',      metrics['mean_mag_both'],  metrics['mean_dop_both'],  'purple'),
+            ('Quiet Sun', metrics['mean_mag_quiet'], metrics['mean_dop_quiet'], 'black'),
+        ]
+    else:
+         series = [
+            ('Umbra',     metrics['mean_mag_umb_residual'],   metrics['mean_dop_umb'],   'red'),
+            ('Penumbra',  metrics['mean_mag_pen_residual'],   metrics['mean_dop_pen'],   'blue'),
+            ('Both',      metrics['mean_mag_both_residual'],  metrics['mean_dop_both'],  'purple'),
+            ('Quiet Sun', None, metrics['mean_dop_quiet'], 'black'),
+        ]
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
     for name, mag, dop, color in series:
-        ax1.plot(time_h, proc(mag), color=color, lw=0.8, label=name)
-        ax2.plot(time_h, proc(dop), color=color, lw=0.8, label=name)
+        if mag is not None:
+            ax1.plot(time_h, proc(mag), color=color, lw=0.8, label=name)
+        if dop is not None:
+            ax2.plot(time_h, proc(dop), color=color, lw=0.8, label=name)
 
     if 'mean_mag_hotspot' in metrics:
         ax1.plot(time_h, proc(metrics['mean_mag_hotspot']), color='darkorange', lw=0.8, label='Hot spot')
