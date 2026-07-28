@@ -161,6 +161,7 @@ def load_and_mask(
     filter_mask: bool = True,
     filter_both: bool = False,
     mag_filter: Callable[[np.ndarray], np.ndarray] | None = None,
+    raw_dopler: bool = False,
 ) -> dict:
     """
     Load the SDO/HMI data cubes and build region masks.
@@ -211,10 +212,15 @@ def load_and_mask(
 
     cube_cont     = _load_cube(ds_dir / 'cube_continuum.fits', fill)
     cube_mag      = _load_cube(ds_dir / 'cube_magnetogram.fits', fill)
-    cube_dop      = _load_cube(ds_dir / 'cube_dopplergram_corrected.fits', fill)
     cube_dop_qsun = _load_cube(ds_dir / 'cube_dopplergram_qsun.fits', fill)
     cube_mag_qsun = _load_cube(ds_dir / 'cube_magnetogram_qsun.fits', fill)
 
+
+    if not raw_dopler:
+        cube_dop      = _load_cube(ds_dir / 'cube_dopplergram_corrected.fits', fill)
+    else:
+        cube_dop      = _load_cube(ds_dir / 'cube_dopplergram.fits', fill)
+    
     n_t = cube_cont.shape[0]
 
     _cad = np.asarray(cadence_s, dtype=float)
@@ -538,6 +544,7 @@ def save_metrics_csv(
     data: dict,
     metrics: dict,
     processed_dir: str | pathlib.Path,
+    raw_dopler: bool = False,
 ) -> pathlib.Path:
     """
     Save the per-frame time-series metrics to a CSV file.
@@ -570,15 +577,20 @@ def save_metrics_csv(
         'mean_mag_pen'  : metrics['mean_mag_pen'],
         'mean_mag_both' : metrics['mean_mag_both'],
         'mean_mag_quiet': metrics['mean_mag_quiet'],
-        'mean_dop_umb'  : metrics['mean_dop_umb'],
-        'mean_dop_pen'  : metrics['mean_dop_pen'],
-        'mean_dop_both' : metrics['mean_dop_both'],
         'mean_dop_quiet': metrics['mean_dop_quiet'],
     }
     if 'area_hotspot' in metrics:
         cols['area_hotspot']     = metrics['area_hotspot']
         cols['mean_mag_hotspot'] = metrics['mean_mag_hotspot']
-
+    
+    if not raw_dopler:
+        cols['mean_dop_umb']  = metrics['mean_dop_umb'],
+        cols['mean_dop_pen']  = metrics['mean_dop_pen'],
+        cols['mean_dop_both'] = metrics['mean_dop_both'],
+    else:
+        cols['mean_dop_umb_uncorrected']  = metrics['mean_dop_umb'],
+        cols['mean_dop_pen_uncorrected']  = metrics['mean_dop_pen'],
+        cols['mean_dop_both_uncorrected'] = metrics['mean_dop_both'],
     df = pd.DataFrame(cols)
     df.to_csv(csv_path, index=False, float_format='%.4f')
     print(f'Metrics saved → {csv_path}  ({len(df)} rows)')
