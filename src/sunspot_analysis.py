@@ -220,7 +220,38 @@ def load_and_mask(
         cube_dop      = _load_cube(ds_dir / 'cube_dopplergram_corrected.fits', fill)
     else:
         cube_dop      = _load_cube(ds_dir / 'cube_dopplergram.fits', fill)
-    
+
+    return masks_from_cubes(
+        cube_cont, cube_mag, cube_dop, cube_dop_qsun, cube_mag_qsun,
+        umbra_thresh=umbra_thresh, penumbra_thresh=penumbra_thresh,
+        cluster_mode=cluster_mode, cadence_s=cadence_s,
+        filter_mask=filter_mask, filter_both=filter_both, mag_filter=mag_filter,
+    )
+
+
+def masks_from_cubes(
+    cube_cont: np.ndarray,
+    cube_mag: np.ndarray,
+    cube_dop: np.ndarray,
+    cube_dop_qsun: np.ndarray,
+    cube_mag_qsun: np.ndarray,
+    umbra_thresh: float = 30_000,
+    penumbra_thresh: float = 50_000,
+    cluster_mode: str = 'largest',
+    cadence_s: float = 720.0,
+    filter_mask: bool = True,
+    filter_both: bool = False,
+    mag_filter: Callable[[np.ndarray], np.ndarray] | None = None,
+) -> dict:
+    """
+    Build region masks and the ``load_and_mask``-style data dict from
+    already-loaded (n_t, ny, nx) cubes, instead of reading FITS files from
+    disk. Used by ``load_and_mask`` internally, and directly by callers that
+    have derived/reconstructed cubes (e.g. from a coefficient-inversion
+    pipeline) rather than the on-disk ones.
+
+    Parameters mirror ``load_and_mask`` — see its docstring for details.
+    """
     n_t = cube_cont.shape[0]
 
     _cad = np.asarray(cadence_s, dtype=float)
@@ -598,13 +629,46 @@ def save_metrics_csv(
     return csv_path
 
 
+def add_mag_residuals(data: dict, metrics: dict, degree: int = 2) -> dict:
+    """
+    Fit a degree-``degree`` polynomial (default: parabola) vs. time to each
+    region's mean magnetogram series and store the residual (raw − fit) in
+    ``metrics`` as ``mean_mag_<region>_residual``.
+
+    This removes slow systematic trends (e.g. foreshortening/mu-angle
+    effects) from the magnetogram time series before pulsation analysis.
+    Generalizes the fit done ad hoc in notebooks/03_data_analisis.ipynb.
+
+    Parameters
+    ----------
+    data    : dict from load_and_mask() / masks_from_cubes()
+    metrics : dict from compute_metrics(); updated in place
+    degree  : polynomial degree for the fit (default 2, i.e. parabolic)
+
+    Returns
+    -------
+    metrics, with the added ``_residual`` keys.
+    """
+    time_h = data['time_h']
+    for region in ('umb', 'pen', 'both', 'hotspot'):
+        key = f'mean_mag_{region}'
+        if key not in metrics:
+            continue
+        series = metrics[key]
+        coeffs = np.polyfit(time_h, series, degree)
+        fit = np.polyval(coeffs, time_h)
+        metrics[f'{key}_residual'] = series - fit
+    return metrics
+
+
 def plot_time_series(
     data: dict,
     metrics: dict,
     normalized: bool = False,
     save: bool = False,
     plots_dir: str | pathlib.Path | None = None,
-    mag_residual: bool = False
+    mag_residual: bool = False,
+    subtract_quiet: bool = False,
 ) -> None:
     """
     Plot mean B and Doppler velocity vs time for umbra, penumbra, both, and quiet sun.
@@ -628,6 +692,7 @@ def plot_time_series(
     ylabel_dop = 'Norm. mean velocity' if normalized else 'Mean velocity  (m/s)'
     suffix     = '_normalized'         if normalized else ''
     suffix     += '_residual'          if mag_residual else ''
+    suffix     += '_minus_quiet'       if subtract_quiet else ''
 
     if not mag_residual:
         series = [
@@ -644,6 +709,22 @@ def plot_time_series(
             ('Quiet Sun', None, metrics['mean_dop_quiet'], 'black'),
         ]
 
+    hotspot_mag = metrics.get('mean_mag_hotspot')
+
+    if subtract_quiet:
+        mag_quiet = metrics['mean_mag_quiet']
+        dop_quiet = metrics['mean_dop_quiet']
+        series = [
+            (name, mag - mag_quiet if mag is not None else None,
+                   dop - dop_quiet if dop is not None else None, color)
+            for name, mag, dop, color in series
+            if name != 'Quiet Sun'
+        ]
+        ylabel_mag = ('Norm. mean B (rel. quiet)' if normalized else 'Mean B − quiet sun  (G)')
+        ylabel_dop = ('Norm. mean velocity (rel. quiet)' if normalized else 'Mean velocity − quiet sun  (m/s)')
+        if hotspot_mag is not None:
+            hotspot_mag = hotspot_mag - mag_quiet
+
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
     for name, mag, dop, color in series:
         if mag is not None:
@@ -651,8 +732,8 @@ def plot_time_series(
         if dop is not None:
             ax2.plot(time_h, proc(dop), color=color, lw=0.8, label=name)
 
-    if 'mean_mag_hotspot' in metrics:
-        ax1.plot(time_h, proc(metrics['mean_mag_hotspot']), color='darkorange', lw=0.8, label='Hot spot')
+    if hotspot_mag is not None:
+        ax1.plot(time_h, proc(hotspot_mag), color='darkorange', lw=0.8, label='Hot spot')
 
     ax1.set_ylabel(ylabel_mag); ax1.set_title('Mean magnetogram' + suffix.replace('_', ' '))
     ax1.grid(alpha=0.3); ax1.legend()
