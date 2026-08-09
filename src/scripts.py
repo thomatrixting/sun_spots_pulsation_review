@@ -11,7 +11,10 @@ Or import individual functions into a notebook:
 import pathlib
 import re
 import sys
+from datetime import timedelta
 
+import astropy.units as u
+import pandas as pd
 from sunpy.net import Fido, attrs as a
 
 # Allow both `python src/scripts.py` and `from src.scripts import ...`
@@ -19,14 +22,17 @@ _PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from src.utilities import ds9_box_to_hpc, make_cube  # noqa: E402
+from src.utilities import ds9_box_to_hpc, make_cube, parse_frame_timestamp  # noqa: E402
 
-# Maps each JSOC series to the glob pattern used to find its files and the
-# label used in the output cube filename.
+# Maps each JSOC series to the glob pattern used to find its files, the label used in
+# the output cube filename, and its native cadence (informational only).
 _SERIES_META = {
-    'hmi.Ic_45s': {'glob': 'hmi.ic_45s.*.continuum.fits',  'label': 'continuum'},
-    'hmi.M_45s':  {'glob': 'hmi.m_45s.*.magnetogram.fits', 'label': 'magnetogram'},
-    'hmi.V_45s':  {'glob': 'hmi.v_45s.*.fits',             'label': 'dopplergram'},
+    'hmi.Ic_45s':  {'glob': 'hmi.ic_45s.*.continuum.fits',   'label': 'continuum',   'cadence_seconds': 45},
+    'hmi.M_45s':   {'glob': 'hmi.m_45s.*.magnetogram.fits',  'label': 'magnetogram', 'cadence_seconds': 45},
+    'hmi.V_45s':   {'glob': 'hmi.v_45s.*.fits',              'label': 'dopplergram', 'cadence_seconds': 45},
+    'hmi.Ic_720s': {'glob': 'hmi.ic_720s.*.continuum.fits',  'label': 'continuum',   'cadence_seconds': 720},
+    'hmi.M_720s':  {'glob': 'hmi.m_720s.*.magnetogram.fits', 'label': 'magnetogram', 'cadence_seconds': 720},
+    'hmi.V_720s':  {'glob': 'hmi.v_720s.*.fits',             'label': 'dopplergram', 'cadence_seconds': 720},
 }
 
 
@@ -44,8 +50,13 @@ def download_single_region(result, output_dir):
 # ── Unified download and cube builder ────────────────────────────────────────
 
 def download_regions(regions_hpc, base_dir, time_start, time_end, notify_email,
-                     series, region_indexes=None):
+                     series, region_indexes=None, sample=None):
     """Search and download HMI cutouts for every region.
+
+    Skips regions/series whose requested range is already fully covered by files on
+    disk, and resumes (rather than re-fetching from scratch) if it's partially covered.
+    Assumes existing files are contiguous from the original start of the range — no gap
+    detection/backfill.
 
     Parameters
     ----------
@@ -53,24 +64,69 @@ def download_regions(regions_hpc, base_dir, time_start, time_end, notify_email,
         JSOC series name — e.g. 'hmi.Ic_45s', 'hmi.M_45s', 'hmi.V_45s'.
     region_indexes : list[int] or None
         1-based region numbers to download. None downloads all regions.
+    sample : astropy.units.Quantity or None
+        If given, passed as a.Sample(sample) to have JSOC downsample server-side
+        (e.g. 360*u.s to get every 8th frame of a 45s series).
+
+    Returns
+    -------
+    dict mapping 1-based region index -> {'status': 'ok'|'skipped'|'failed', ...}
     """
     base_dir = pathlib.Path(base_dir)
+    meta = _SERIES_META[series]
+    requested_end = pd.Timestamp(time_end).to_pydatetime()
+
+    summary = {}
     for i, (bl, tr) in enumerate(regions_hpc):
         if region_indexes is not None and (i + 1) not in region_indexes:
             print(f"Region {i+1:02d}: skipped")
             continue
         region_dir = base_dir / f'region_{i+1:02d}'
         region_dir.mkdir(parents=True, exist_ok=True)
-        cutout = a.jsoc.Cutout(bl, top_right=tr, tracking=True)
-        result = Fido.search(
-            a.Time(time_start, time_end),
-            a.jsoc.Series(series),
-            a.jsoc.Notify(notify_email),
-            cutout,
-        )
-        print(f"Region {i+1:02d}: {len(result[0])} frames found")
-        files = Fido.fetch(result, path=region_dir)
-        print(f"  -> {len(files)} files saved to {region_dir}")
+
+        existing = sorted(region_dir.glob(meta['glob']))
+        existing_timestamps = [ts for ts in (parse_frame_timestamp(p) for p in existing) if ts is not None]
+        latest = max(existing_timestamps) if existing_timestamps else None
+
+        if latest is not None and latest >= requested_end:
+            print(f"Region {i+1:02d} [{series}]: already covers requested range through {latest} — skipping")
+            summary[i + 1] = {'status': 'skipped', 'files': existing}
+            continue
+
+        if latest is None:
+            fetch_start_dt = None
+            fetch_start = time_start
+        else:
+            # JSOC's time-range query rounds an in-between start back down to the nearest
+            # existing record (verified live: start = latest + 1s still returned `latest`
+            # itself) — nudge by a full cadence step (the actual sampling interval, native
+            # or a.Sample-downsampled) so the resume request can't re-include it.
+            step_seconds = sample.to_value(u.s) if sample is not None else meta['cadence_seconds']
+            fetch_start_dt = latest + timedelta(seconds=step_seconds)
+            fetch_start = fetch_start_dt.isoformat()
+
+        if fetch_start_dt is not None and fetch_start_dt >= requested_end:
+            print(f"Region {i+1:02d} [{series}]: already covers requested range through {latest} — skipping")
+            summary[i + 1] = {'status': 'skipped', 'files': existing}
+            continue
+
+        try:
+            cutout = a.jsoc.Cutout(bl, top_right=tr, tracking=True)
+            query_args = [a.Time(fetch_start, time_end), a.jsoc.Series(series), a.jsoc.Notify(notify_email), cutout]
+            if sample is not None:
+                query_args.append(a.Sample(sample))
+            result = Fido.search(*query_args)
+
+            resumed = ' (resuming)' if latest is not None else ''
+            print(f"Region {i+1:02d} [{series}]: {len(result[0])} new frames found{resumed}")
+            files = Fido.fetch(result, path=region_dir)
+            print(f"  -> {len(files)} files saved to {region_dir}")
+            summary[i + 1] = {'status': 'ok', 'files': files}
+        except Exception as exc:
+            print(f"Region {i+1:02d} [{series}]: FAILED — {exc!r}")
+            summary[i + 1] = {'status': 'failed', 'error': str(exc)}
+
+    return summary
 
 
 def make_cubes(regions_hpc, base_dir, series, region_indexes=None):
