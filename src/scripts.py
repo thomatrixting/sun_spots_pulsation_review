@@ -50,7 +50,7 @@ def download_single_region(result, output_dir):
 # ── Unified download and cube builder ────────────────────────────────────────
 
 def download_regions(regions_hpc, base_dir, time_start, time_end, notify_email,
-                     series, region_indexes=None, sample=None):
+                     series, region_indexes=None, sample=None, tracking=True):
     """Search and download HMI cutouts for every region.
 
     Skips regions/series whose requested range is already fully covered by files on
@@ -67,10 +67,18 @@ def download_regions(regions_hpc, base_dir, time_start, time_end, notify_email,
     sample : astropy.units.Quantity or None
         If given, passed as a.Sample(sample) to have JSOC downsample server-side
         (e.g. 360*u.s to get every 8th frame of a 45s series).
+    tracking : bool
+        Whether JSOC should rotate the cutout box with the solar surface. True for
+        following an active region. False pins the box to fixed helioprojective
+        coordinates, which is what a disk-centre reference region needs — see
+        src.doppler_calibration.download_disk_center.
 
     Returns
     -------
-    dict mapping 1-based region index -> {'status': 'ok'|'skipped'|'failed', ...}
+    dict mapping 1-based region index -> {'status': 'ok'|'skipped'|'partial'|'failed', ...}
+    'partial' means some individual files still failed after one retry; their URLs are
+    under 'failed_urls'. Treat it as seriously as 'failed' — a missing mid-window frame
+    silently shifts every later frame out of step with the other series.
     """
     base_dir = pathlib.Path(base_dir)
     meta = _SERIES_META[series]
@@ -111,17 +119,35 @@ def download_regions(regions_hpc, base_dir, time_start, time_end, notify_email,
             continue
 
         try:
-            cutout = a.jsoc.Cutout(bl, top_right=tr, tracking=True)
+            cutout = a.jsoc.Cutout(bl, top_right=tr, tracking=tracking)
             query_args = [a.Time(fetch_start, time_end), a.jsoc.Series(series), a.jsoc.Notify(notify_email), cutout]
             if sample is not None:
                 query_args.append(a.Sample(sample))
             result = Fido.search(*query_args)
 
+            n_found = len(result[0]) if len(result) else 0
             resumed = ' (resuming)' if latest is not None else ''
-            print(f"Region {i+1:02d} [{series}]: {len(result[0])} new frames found{resumed}")
+            print(f"Region {i+1:02d} [{series}]: {n_found} new frames found{resumed}")
+            if n_found == 0:
+                summary[i + 1] = {'status': 'ok', 'files': []}
+                continue
+
             files = Fido.fetch(result, path=region_dir)
+            # parfive reports per-file failures on .errors instead of raising; left unchecked
+            # these become silent *mid-window* gaps that later misalign the three series
+            # against each other. Retry once (re-fetching a Results retries only its errors,
+            # and returns every path, old successes included).
+            if files.errors:
+                print(f"  {len(files.errors)} file(s) failed — retrying")
+                files = Fido.fetch(files)
+
             print(f"  -> {len(files)} files saved to {region_dir}")
-            summary[i + 1] = {'status': 'ok', 'files': files}
+            if files.errors:
+                failed_urls = [err.url for err in files.errors]
+                print(f"  PARTIAL: {len(failed_urls)} file(s) still missing after retry")
+                summary[i + 1] = {'status': 'partial', 'files': files, 'failed_urls': failed_urls}
+            else:
+                summary[i + 1] = {'status': 'ok', 'files': files}
         except Exception as exc:
             print(f"Region {i+1:02d} [{series}]: FAILED — {exc!r}")
             summary[i + 1] = {'status': 'failed', 'error': str(exc)}
@@ -129,7 +155,7 @@ def download_regions(regions_hpc, base_dir, time_start, time_end, notify_email,
     return summary
 
 
-def make_cubes(regions_hpc, base_dir, series, region_indexes=None):
+def make_cubes(regions_hpc, base_dir, series, region_indexes=None, overwrite=True):
     """Build one FITS cube per region from downloaded frames.
 
     Parameters
@@ -138,6 +164,9 @@ def make_cubes(regions_hpc, base_dir, series, region_indexes=None):
         JSOC series name — e.g. 'hmi.Ic_45s', 'hmi.M_45s', 'hmi.V_45s'.
     region_indexes : list[int] or None
         1-based region numbers to process. None processes all regions.
+    overwrite : bool
+        Rebuild cubes that already exist. False skips them, which makes re-running a
+        notebook cheap once the frames on disk have stopped changing.
     """
     if series not in _SERIES_META:
         raise ValueError(f"Unknown series '{series}'. Known: {list(_SERIES_META)}")
@@ -150,7 +179,7 @@ def make_cubes(regions_hpc, base_dir, series, region_indexes=None):
         make_cube(
             region_dir / meta['glob'],
             base_dir / f'region_{i:02d}_{meta["label"]}_cube.fits',
-            overwrite=True,
+            overwrite=overwrite,
         )
 
 

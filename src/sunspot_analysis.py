@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from astropy.io import fits
-from matplotlib.animation import FuncAnimation
+from matplotlib.animation import FuncAnimation, HTMLWriter
 from scipy import ndimage
 from scipy.io import readsav
 from scipy.signal import find_peaks
@@ -285,6 +285,90 @@ def masks_from_cubes(
         umbra=umbra, penumbra=penumbra, both=both, hot_spot=hot_spot,
         time_h=time_h, n_t=n_t, cadence_s=median_cadence,
         umbra_thresh=umbra_thresh, penumbra_thresh=penumbra_thresh,
+    )
+
+
+def load_noaa_region(
+    processed_dir: str | pathlib.Path,
+    region: str = 'region_01',
+) -> dict:
+    """
+    Build the ``load_and_mask``-style data dict from the corrected cubes that
+    ``notebooks/02A_data_procesing.ipynb`` writes for a NOAA region.
+
+    This is the bridge between the NOAA pipeline and everything in this module: the
+    result can be passed straight to ``compute_metrics``, ``plot_magnetogram_masks``,
+    ``plot_time_series``, ``plot_area``, ``plot_ffts_*`` and ``save_animation`` exactly
+    like a ``load_and_mask`` result for a DS0X directory.
+
+    The differences from ``load_and_mask``, all handled here:
+
+    - **Masks are read, not re-derived.** 02A thresholds each frame against its own
+      quiet-sun intensity; re-deriving them here with the absolute ``umbra_thresh`` /
+      ``penumbra_thresh`` of ``masks_from_cubes`` would give different regions than the
+      ones the saved cubes were corrected against. They come out of the ``uint8`` bitmask
+      cube instead, hot spot included.
+    - **No quiet-sun patch cubes exist** for these regions. ``compute_metrics`` only ever
+      takes ``np.nanmean(cube_qsun[t])`` of them, so the per-frame quiet-sun means saved
+      by 02A are reshaped to ``(n_t, 1, 1)`` rather than materialising two full cubes.
+    - **Cadence is measured, not assumed.** It is taken as the median timestamp spacing —
+      NOAA 11117 is sampled at ~360 s while the other regions are at 720 s, so a fixed
+      cadence would put its FFT frequency axis out by a factor of two.
+
+    Parameters
+    ----------
+    processed_dir : path to ``data/processed/NOAA_<noaa>_<date>/``
+    region        : region prefix within that directory (default ``'region_01'``)
+
+    Returns
+    -------
+    dict with the same keys as ``masks_from_cubes``, plus ``timestamps``.
+    """
+    from src.utilities import read_cube
+
+    processed_dir = pathlib.Path(processed_dir)
+
+    cube_cont, timestamps = read_cube(processed_dir / f'{region}_continuum_cube.fits')
+    cube_mag, _ = read_cube(processed_dir / f'{region}_magnetogram_corrected_cube.fits')
+    cube_dop, _ = read_cube(processed_dir / f'{region}_dopplergram_calibrated_cube.fits')
+    masks_path = processed_dir / f'{region}_masks_cube.fits'
+    bitmask, _ = read_cube(masks_path)
+
+    header = fits.getheader(masks_path)
+    bit_umb = header.get('BIT_UMB', 1)
+    bit_pen = header.get('BIT_PEN', 2)
+    bit_hot = header.get('BIT_HOT', 4)
+    umb_frac = header.get('UMB_FRAC', 0.60)
+    pen_frac = header.get('PEN_FRAC', 0.90)
+
+    umbra    = (bitmask & bit_umb).astype(bool)
+    penumbra = (bitmask & bit_pen).astype(bool)
+    hot_spot = (bitmask & bit_hot).astype(bool)
+    both     = umbra | penumbra
+
+    with fits.open(processed_dir / f'{region}_qsun_means.fits') as hdul:
+        qsun = hdul['QSUN'].data
+        mag_qsun = np.asarray(qsun['MEAN_MAG_QSUN'], dtype=float)
+        dop_qsun = np.asarray(qsun['MEAN_DOP_QSUN'], dtype=float)
+        i_qs     = np.asarray(qsun['I_QS'], dtype=float)
+
+    n_t = len(timestamps)
+    seconds = np.array([(t - timestamps[0]).total_seconds() for t in timestamps])
+    gaps = np.diff(seconds)
+    cadence_s = float(np.median(gaps)) if gaps.size else np.nan
+
+    return dict(
+        cube_cont=cube_cont, cube_mag=cube_mag, cube_dop=cube_dop,
+        # Shaped (n_t, 1, 1) so np.nanmean(cube[t]) returns the saved per-frame mean.
+        cube_dop_qsun=dop_qsun.reshape(n_t, 1, 1),
+        cube_mag_qsun=mag_qsun.reshape(n_t, 1, 1),
+        umbra=umbra, penumbra=penumbra, both=both, hot_spot=hot_spot,
+        time_h=seconds / 3600, n_t=n_t, cadence_s=cadence_s,
+        timestamps=timestamps,
+        # plot_magnetogram_masks uses these only for its legend text. Report the absolute
+        # DN the fractional cut actually worked out to, so the label stays truthful.
+        umbra_thresh=float(np.nanmedian(i_qs) * umb_frac),
+        penumbra_thresh=float(np.nanmedian(i_qs) * pen_frac),
     )
 
 
@@ -959,6 +1043,7 @@ def save_animation(
     fps: int = 5,
     embed_limit_mb: float = 50.0,
     mag_symmetric_cbar: bool = True,
+    embed_frames: bool = True,
 ) -> None:
     """
     Save a 3-channel (continuum / magnetogram / dopplergram) animation as HTML.
@@ -971,6 +1056,11 @@ def save_animation(
     step               : subsample every Nth frame to keep file size manageable
     fps                : frames per second
     embed_limit_mb     : matplotlib animation size limit in MB
+    embed_frames       : if True (default) the frames are base64'd into the .html, so it
+                         is a single self-contained file that can be moved or shared.
+                         False writes them to a sibling ``<name>_frames/`` directory
+                         instead — smaller, but the .html breaks if it is moved without
+                         that directory. Raise ``step`` if an embedded file gets too big.
     mag_symmetric_cbar : if True, use a symmetric colorbar for the magnetogram
                          channel centred at zero (vmin = −vmax where vmax is the
                          99th percentile of |B| across all frames).  Default False
@@ -1063,5 +1153,11 @@ def save_animation(
     anim = FuncAnimation(fig, _update, frames=len(frames_idx),
                          interval=1000 // fps, blit=False)
     plt.close(fig)
-    anim.save(str(save_path), writer='html', fps=fps)
-    print(f'Animation saved → {save_path}')
+    # HTMLWriter defaults to embed_frames=False, which scatters the frames into a sibling
+    # directory the .html then depends on. Pass the writer explicitly so the default here
+    # is a single portable file, as embed_limit_mb always implied.
+    anim.save(str(save_path),
+              writer=HTMLWriter(fps=fps, embed_frames=embed_frames))
+    size_mb = save_path.stat().st_size / 1e6
+    print(f'Animation saved → {save_path}  ({len(frames_idx)} frames, {size_mb:.1f} MB'
+          f'{"" if embed_frames else ", frames in a sibling directory"})')
