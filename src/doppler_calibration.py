@@ -458,7 +458,7 @@ def disk_center_velocity_series(disk_center_dir, radius: u.Quantity = 15 * u.arc
 
 def calibrate_cube(region_dir, sdo_method: str = 'keywords', v_sdo_by_time=None,
                    include: tuple[str, ...] = ALL_TERMS, region: str = 'region_01',
-                   include_meridional: bool = True, series_glob: str = 'hmi.v_720s.*.fits'):
+                   include_meridional: bool = True, series_glob: str = 'hmi.v_*.fits'):
     """Apply the calibration to every frame of a Dopplergram cube.
 
     The corrections are per-frame, not per-cube: a tracked box sweeps across the sky, and
@@ -477,6 +477,12 @@ def calibrate_cube(region_dir, sdo_method: str = 'keywords', v_sdo_by_time=None,
     v_sdo_by_time : dict, optional
         timestamp -> velocity (or (velocity, n_pixels), as returned by
         `disk_center_velocity_series`).
+    series_glob : str
+        Frame filename pattern. The default deliberately matches every cadence
+        (``hmi.v_720s.*.fits`` and ``hmi.v_45s.*.Dopplergram.fits``): NOAA 11117 has to be
+        downloaded from the 45 s series because JSOC's 720 s series 500-errors across its
+        window, and a 720 s-only pattern silently finds no frames and reports every frame
+        of the cube as missing.
 
     Returns
     -------

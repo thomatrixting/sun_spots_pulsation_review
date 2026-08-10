@@ -314,6 +314,12 @@ def load_noaa_region(
     - **Cadence is measured, not assumed.** It is taken as the median timestamp spacing —
       NOAA 11117 is sampled at ~360 s while the other regions are at 720 s, so a fixed
       cadence would put its FFT frequency axis out by a factor of two.
+    - **Gap frames are flagged.** 02A puts the three series on a uniform grid and NaN-fills
+      the slots a series has no frame for, recording which those are in the qsun table's
+      ``PRESENT_*`` columns. They are read back into ``data['present']`` because the mask
+      cube is ``uint8`` and cannot hold a NaN: without the flags, a gap frame's empty masks
+      are indistinguishable from a frame in which the spot was not detected. Cubes written
+      before those columns existed simply come back with ``present=None``.
 
     Parameters
     ----------
@@ -322,7 +328,7 @@ def load_noaa_region(
 
     Returns
     -------
-    dict with the same keys as ``masks_from_cubes``, plus ``timestamps``.
+    dict with the same keys as ``masks_from_cubes``, plus ``timestamps`` and ``present``.
     """
     from src.utilities import read_cube
 
@@ -348,9 +354,17 @@ def load_noaa_region(
 
     with fits.open(processed_dir / f'{region}_qsun_means.fits') as hdul:
         qsun = hdul['QSUN'].data
+        columns  = qsun.columns.names
         mag_qsun = np.asarray(qsun['MEAN_MAG_QSUN'], dtype=float)
         dop_qsun = np.asarray(qsun['MEAN_DOP_QSUN'], dtype=float)
         i_qs     = np.asarray(qsun['I_QS'], dtype=float)
+        c_mean   = (np.asarray(qsun['C_MEAN'], dtype=float)
+                    if 'C_MEAN' in columns else None)
+        # Written by 02A since the uniform-grid join; absent from older cubes, which had
+        # no gap frames to describe because the join dropped them instead.
+        present = ({name: np.asarray(qsun[f'PRESENT_{name.upper()}'], dtype=bool)
+                    for name in ('cont', 'mag', 'dop')}
+                   if 'PRESENT_CONT' in columns else None)
 
     n_t = len(timestamps)
     seconds = np.array([(t - timestamps[0]).total_seconds() for t in timestamps])
@@ -364,7 +378,7 @@ def load_noaa_region(
         cube_mag_qsun=mag_qsun.reshape(n_t, 1, 1),
         umbra=umbra, penumbra=penumbra, both=both, hot_spot=hot_spot,
         time_h=seconds / 3600, n_t=n_t, cadence_s=cadence_s,
-        timestamps=timestamps,
+        timestamps=timestamps, present=present, i_qs=i_qs, c_mean=c_mean,
         # plot_magnetogram_masks uses these only for its legend text. Report the absolute
         # DN the fractional cut actually worked out to, so the label stays truthful.
         umbra_thresh=float(np.nanmedian(i_qs) * umb_frac),
@@ -614,6 +628,11 @@ def compute_metrics(data: dict) -> dict:
     Quiet sun uses the spatial mean of the dedicated qsun cubes
     (``cube_dopplergram_qsun`` / ``cube_magnetogram_qsun``) — not a mask.
 
+    **Gap frames.** Where ``data['present']`` says a frame has no continuum (a NaN slot on
+    02A's uniform time grid), the areas are set to NaN. The mean series need no such
+    handling — an all-NaN frame already averages to NaN — but an area would otherwise come
+    back as a perfectly confident 0 px, which plots as the spot briefly vanishing.
+
     Parameters
     ----------
     data : dict from load_and_mask()
@@ -651,6 +670,15 @@ def compute_metrics(data: dict) -> dict:
     if hot_spot is not None:
         result['mean_mag_hotspot'] = _mean_series(cube_mag, hot_spot)
         result['area_hotspot']     = hot_spot.sum(axis=(1, 2)).astype(float)
+
+    # A frame with no continuum has empty masks by construction, so its areas mean
+    # "no data", not "no spot".
+    present = data.get('present')
+    if present is not None:
+        missing = ~np.asarray(present['cont'], dtype=bool)
+        for key in ('area_umb', 'area_pen', 'area_both', 'area_hotspot'):
+            if key in result:
+                result[key][missing] = np.nan
 
     return result
 

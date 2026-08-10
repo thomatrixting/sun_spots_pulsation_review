@@ -337,11 +337,27 @@ def regular_time_grid(time_lists, cadence_s=None, tolerance_s=None):
     time_lists : sequence of sequences of datetime
         One list per series. Order and duplicates don't matter.
     cadence_s : float, optional
-        Grid spacing. Default is the median spacing of the pooled timestamps, which is
-        robust to gaps: a handful of doubled intervals cannot move the median.
+        Grid spacing. Default is the *finest* of the per-series median spacings — see the
+        note below on why it is neither the pooled median nor a per-series maximum.
     tolerance_s : float, optional
         How far a real timestamp may sit from its grid slot. Default `cadence_s / 2`, i.e.
         each timestamp claims its nearest slot and nothing else.
+
+    Notes
+    -----
+    The cadence and the validation are both **per series**, not over the pooled timestamps,
+    because the three series do not necessarily share a clock. NOAA 11117 has to be fetched
+    from the 45 s series (JSOC's 720 s series 500-errors across its window) with
+    ``a.Sample``, and the records that come back sit on grids offset from each other by
+    45 s: continuum and Dopplergram every 360 s, magnetogram every 720 s, and mostly
+    45 s later. Pooling those gives alternating 45 s and 315 s intervals and a median of
+    315 s, which describes none of the three.
+
+    Per series it is unambiguous: medians of 360, 720 and 360 s. The grid takes the
+    **finest** of them, since a grid coarser than the fastest series would put two of that
+    series' frames in one slot; the slower series simply leaves every other slot empty.
+    Two frames from *different* series landing in one slot is not a collision — it is the
+    entire point of a shared grid.
 
     Returns
     -------
@@ -350,15 +366,20 @@ def regular_time_grid(time_lists, cadence_s=None, tolerance_s=None):
     """
     from datetime import timedelta
 
+    series = [sorted(set(times)) for times in time_lists if len(times)]
     pooled = sorted({t for times in time_lists for t in times})
     if not pooled:
         raise ValueError('regular_time_grid: no timestamps given')
     if len(pooled) == 1:
         return list(pooled), float(cadence_s or 0.0)
 
-    diffs = np.diff([t.timestamp() for t in pooled])
     if cadence_s is None:
-        cadence_s = float(np.median(diffs))
+        medians = [float(np.median(np.diff([t.timestamp() for t in times])))
+                   for times in series if len(times) > 1]
+        # No series has two timestamps of its own, so there is no per-series spacing to
+        # measure; the pooled spacing is all there is.
+        cadence_s = min(medians) if medians else float(
+            np.median(np.diff([t.timestamp() for t in pooled])))
     cadence_s = float(cadence_s)
     if cadence_s <= 0:
         raise ValueError(f'regular_time_grid: cadence must be positive, got {cadence_s}')
@@ -370,8 +391,11 @@ def regular_time_grid(time_lists, cadence_s=None, tolerance_s=None):
     grid = [pooled[0] + timedelta(seconds=i * cadence_s) for i in range(n)]
 
     # Verify before returning, so a wrong cadence surfaces here rather than as a subtly
-    # mis-slotted cube 200 lines downstream.
-    _slot_indices(pooled, grid[0], cadence_s, tolerance_s, len(grid))
+    # mis-slotted cube 200 lines downstream. One series at a time: `_slot_indices` refuses
+    # two timestamps in one slot, which is right within a series (the cadence is wrong) and
+    # wrong across them (they are the same instant observed by two instruments).
+    for times in series:
+        _slot_indices(times, grid[0], cadence_s, tolerance_s, len(grid))
     return grid, cadence_s
 
 
@@ -440,6 +464,98 @@ def reindex_on_grid(cube, times, grid, cadence_s, tolerance_s=None):
         out[k] = cube[i]
         present[k] = True
     return out, present
+
+
+def crop_to_common_window(cubes, present=None, verbose=True):
+    """Put cubes on one spatial grid and trim to the window where all of them have data.
+
+    Two separate things put NaN borders on a cube, and this removes both:
+
+    - **The box changed mid-window.** A tracked cutout is supposed to have a constant pixel
+      size, but if a region is re-downloaded under a different box — or JSOC returns a
+      smaller patch for part of the window, which is what NOAA 11117 does towards the end —
+      `make_cube` center-crops/NaN-pads the odd frames onto the majority grid. Those frames
+      then carry a NaN frame of padding that no segmentation threshold will ever select, so
+      the mask areas step down for exactly as long as the smaller box lasted.
+    - **The three series were downloaded under different boxes.** NOAA 11117's magnetogram
+      is 402x402 against 433x433 for its continuum and Dopplergram, so the cubes cannot even
+      be indexed against each other.
+
+    The window is the intersection, over every frame of every cube, of the bounding box of
+    that frame's finite pixels — the largest rectangle in which nothing is padding. Frames
+    are matched to the smallest common shape by center-cropping first, mirroring
+    `_fit_to_shape`'s centered padding so the two undo each other.
+
+    Using each frame's *bounding box* rather than its finite pixels means an isolated bad
+    pixel in the middle of a frame cannot shrink the window; only missing edges can.
+
+    Parameters
+    ----------
+    cubes : dict of str -> ndarray, each (n_t, ny, nx)
+        All must have the same n_t; the spatial shapes may differ.
+    present : dict of str -> bool array, optional
+        Which frames of each cube hold real data. Gap frames are entirely NaN and would
+        collapse the window to nothing, so they are skipped.
+    verbose : bool
+        Print what was trimmed. Worth leaving on — a crop that eats most of the box means
+        the region was downloaded under two very different geometries.
+
+    Returns
+    -------
+    (cropped, offsets)
+        `cropped` maps each name to its trimmed cube, all now the same shape.
+        `offsets` maps each name to the ``(row0, col0)`` of the window in *that cube's own
+        original pixel coordinates*, so a caller can shift CRPIX1/CRPIX2 and keep the WCS
+        pointing at the same sky.
+    """
+    shapes = {name: cube.shape[1:] for name, cube in cubes.items()}
+    target = (min(s[0] for s in shapes.values()), min(s[1] for s in shapes.values()))
+
+    # Center-crop onto the common shape, and remember by how much, so the offsets come back
+    # in each cube's own coordinates rather than in the intermediate grid's.
+    centered, center_offset = {}, {}
+    for name, cube in cubes.items():
+        ny, nx = shapes[name]
+        r0, c0 = (ny - target[0]) // 2, (nx - target[1]) // 2
+        center_offset[name] = (r0, c0)
+        centered[name] = (cube if (ny, nx) == target
+                          else cube[:, r0:r0 + target[0], c0:c0 + target[1]])
+
+    row_lo, row_hi = 0, target[0] - 1
+    col_lo, col_hi = 0, target[1] - 1
+    for name, cube in centered.items():
+        rows = np.isfinite(cube).any(axis=2)          # (n_t, ny)
+        cols = np.isfinite(cube).any(axis=1)          # (n_t, nx)
+        usable = rows.any(axis=1)
+        if present is not None and name in present:
+            usable &= np.asarray(present[name], dtype=bool)
+        if not usable.any():
+            raise ValueError(f'crop_to_common_window: every frame of {name!r} is all-NaN')
+        rows, cols = rows[usable], cols[usable]
+        row_lo = max(row_lo, int(rows.argmax(axis=1).max()))
+        row_hi = min(row_hi, int((target[0] - 1 - rows[:, ::-1].argmax(axis=1)).min()))
+        col_lo = max(col_lo, int(cols.argmax(axis=1).max()))
+        col_hi = min(col_hi, int((target[1] - 1 - cols[:, ::-1].argmax(axis=1)).min()))
+
+    if row_hi < row_lo or col_hi < col_lo:
+        raise ValueError(
+            f'crop_to_common_window: the frames share no common data window '
+            f'(rows {row_lo}..{row_hi}, cols {col_lo}..{col_hi}). The boxes these cubes '
+            f'were downloaded under do not overlap — re-download the region.')
+
+    window = (slice(row_lo, row_hi + 1), slice(col_lo, col_hi + 1))
+    cropped = {name: cube[:, window[0], window[1]] for name, cube in centered.items()}
+    offsets = {name: (center_offset[name][0] + row_lo, center_offset[name][1] + col_lo)
+               for name in cubes}
+
+    if verbose:
+        shape_list = ', '.join(f'{n}={s[0]}x{s[1]}' for n, s in shapes.items())
+        new = next(iter(cropped.values())).shape[1:]
+        kept = 100 * (new[0] * new[1]) / (target[0] * target[1])
+        print(f'  cropped to the common data window: {shape_list} -> {new[0]}x{new[1]} '
+              f'({kept:.0f}% of the smallest input box)')
+
+    return cropped, offsets
 
 
 def reindex_series_on_grid(values, times, grid, cadence_s, tolerance_s=None):
