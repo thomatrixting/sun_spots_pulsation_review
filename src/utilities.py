@@ -318,6 +318,148 @@ def read_cube(path):
     return data, timestamps
 
 
+def regular_time_grid(time_lists, cadence_s=None, tolerance_s=None):
+    """Build one evenly-spaced time axis covering every timestamp in `time_lists`.
+
+    The three HMI series of a region are downloaded independently and individual JSOC files
+    do fail, so their frame counts differ. Joining them on the *intersection* of their
+    timestamps throws away good frames from the other series and, worse, leaves holes in the
+    time axis: NOAA 11536's Dopplergram is missing 2012-08-01 09:48 and 2012-08-02 21:48, so
+    the intersection has two 1440 s jumps in an otherwise 720 s series. Anything that assumes
+    a single cadence — every FFT in src/sunspot_analysis.py — is then quietly wrong.
+
+    This returns a grid that is uniform *by construction* rather than one inherited from
+    whatever happened to download, so a missing frame becomes a NaN frame at the right time
+    (see `reindex_on_grid`) instead of a shortened axis.
+
+    Parameters
+    ----------
+    time_lists : sequence of sequences of datetime
+        One list per series. Order and duplicates don't matter.
+    cadence_s : float, optional
+        Grid spacing. Default is the median spacing of the pooled timestamps, which is
+        robust to gaps: a handful of doubled intervals cannot move the median.
+    tolerance_s : float, optional
+        How far a real timestamp may sit from its grid slot. Default `cadence_s / 2`, i.e.
+        each timestamp claims its nearest slot and nothing else.
+
+    Returns
+    -------
+    (grid, cadence_s)
+        `grid` is a list of datetimes from the earliest to the latest timestamp inclusive.
+    """
+    from datetime import timedelta
+
+    pooled = sorted({t for times in time_lists for t in times})
+    if not pooled:
+        raise ValueError('regular_time_grid: no timestamps given')
+    if len(pooled) == 1:
+        return list(pooled), float(cadence_s or 0.0)
+
+    diffs = np.diff([t.timestamp() for t in pooled])
+    if cadence_s is None:
+        cadence_s = float(np.median(diffs))
+    cadence_s = float(cadence_s)
+    if cadence_s <= 0:
+        raise ValueError(f'regular_time_grid: cadence must be positive, got {cadence_s}')
+    if tolerance_s is None:
+        tolerance_s = cadence_s / 2
+
+    span = (pooled[-1] - pooled[0]).total_seconds()
+    n = int(round(span / cadence_s)) + 1
+    grid = [pooled[0] + timedelta(seconds=i * cadence_s) for i in range(n)]
+
+    # Verify before returning, so a wrong cadence surfaces here rather than as a subtly
+    # mis-slotted cube 200 lines downstream.
+    _slot_indices(pooled, grid[0], cadence_s, tolerance_s, len(grid))
+    return grid, cadence_s
+
+
+def _slot_indices(times, grid_start, cadence_s, tolerance_s, n_slots):
+    """Map timestamps onto grid slots, raising rather than mangling the axis.
+
+    A timestamp that doesn't fit its nearest slot, or two timestamps landing in the same
+    one, means the assumed cadence is wrong. Both are refused: silently snapping them is
+    precisely the failure `regular_time_grid` exists to prevent.
+    """
+    seen, indices = {}, []
+    for t in times:
+        offset = (t - grid_start).total_seconds()
+        k = int(round(offset / cadence_s))
+        drift = abs(offset - k * cadence_s)
+        if not 0 <= k < n_slots:
+            raise ValueError(
+                f'timestamp {t} maps to grid slot {k}, outside 0..{n_slots - 1} — the '
+                f'assumed cadence of {cadence_s:g} s does not describe this series')
+        if drift > tolerance_s:
+            raise ValueError(
+                f'timestamp {t} is {drift:.1f} s from its nearest grid slot, more than the '
+                f'{tolerance_s:.1f} s tolerance — the series is not on a {cadence_s:g} s '
+                f'cadence. Pass an explicit cadence_s, or a larger tolerance_s if the '
+                f'jitter is real.')
+        if k in seen:
+            raise ValueError(
+                f'timestamps {seen[k]} and {t} both map to grid slot {k} — the assumed '
+                f'cadence of {cadence_s:g} s is too coarse for this series')
+        seen[k] = t
+        indices.append(k)
+    return indices
+
+
+def reindex_on_grid(cube, times, grid, cadence_s, tolerance_s=None):
+    """Place a cube's frames onto `grid`, leaving NaN frames where the series has no data.
+
+    This is the "keep the times consistent" half of the join: the output always has one
+    frame per grid slot, so the three series stay index-aligned with each other and with the
+    time axis, and a missing mid-window frame stays visible as a gap instead of pulling every
+    later frame one slot out of step.
+
+    Parameters
+    ----------
+    cube : ndarray, shape (n_t, ny, nx)
+    times : sequence of datetime
+        One per frame of `cube`.
+    grid, cadence_s : as returned by `regular_time_grid`.
+
+    Returns
+    -------
+    (out, present)
+        `out` is float32, shape `(len(grid), ny, nx)`, NaN in unfilled slots.
+        `present` is a `(len(grid),)` bool array — True where this series has a real frame.
+    """
+    if len(times) != len(cube):
+        raise ValueError(f'{len(cube)} frames but {len(times)} timestamps')
+    if tolerance_s is None:
+        tolerance_s = cadence_s / 2
+
+    indices = _slot_indices(times, grid[0], cadence_s, tolerance_s, len(grid))
+
+    out = np.full((len(grid), *cube.shape[1:]), np.nan, dtype=np.float32)
+    present = np.zeros(len(grid), dtype=bool)
+    for i, k in enumerate(indices):
+        out[k] = cube[i]
+        present[k] = True
+    return out, present
+
+
+def reindex_series_on_grid(values, times, grid, cadence_s, tolerance_s=None):
+    """`reindex_on_grid` for a 1-D per-frame series (e.g. a correction term's mean).
+
+    Kept separate rather than folded in with a shape check, because a 1-D array of length
+    n_t and a cube of n_t frames want visibly different call sites.
+    """
+    values = np.asarray(values, dtype=float)
+    if len(times) != len(values):
+        raise ValueError(f'{len(values)} values but {len(times)} timestamps')
+    if tolerance_s is None:
+        tolerance_s = cadence_s / 2
+
+    indices = _slot_indices(times, grid[0], cadence_s, tolerance_s, len(grid))
+    out = np.full(len(grid), np.nan)
+    out[indices] = values
+    return out
+
+
 def ds9_box_to_hpc(x_c_ds9, y_c_ds9, w_px, h_px, hmi_map):
     """
     Convert a DS9 box region (1-indexed pixels) to Helioprojective corner coordinates.
