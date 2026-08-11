@@ -586,9 +586,33 @@ def write_masks_cube(data: dict, path, header=None, history=None):
                           '03A: a gap frame has every bit 0'])
 
 
+def _fill_nearest_frames(cube: np.ndarray, present: np.ndarray, max_slots: int):
+    """Fill absent frames from the nearest present one within ``max_slots``, in place.
+
+    For a series whose frames land on grid slots that another series never occupies. See
+    `load_noaa_region`'s ``mag_fill_slots`` for the case this exists for.
+
+    Returns the ``filled`` bool array — slots that now hold a copy of a neighbour rather
+    than their own observation.
+    """
+    present = np.asarray(present, dtype=bool)
+    filled = np.zeros(len(present), dtype=bool)
+    have = np.flatnonzero(present)
+    if not len(have):
+        return filled
+
+    for t in np.flatnonzero(~present):
+        j = have[np.argmin(np.abs(have - t))]
+        if abs(j - t) <= max_slots:
+            cube[t] = cube[j]
+            filled[t] = True
+    return filled
+
+
 def load_noaa_region(
     processed_dir: str | pathlib.Path,
     region: str = 'region_01',
+    mag_fill_slots: int = 0,
     **region_kwargs,
 ) -> dict:
     """
@@ -623,6 +647,21 @@ def load_noaa_region(
     ----------
     processed_dir : path to ``data/processed/NOAA_<noaa>_<date>/``
     region        : region prefix within that directory (default ``'region_01'``)
+    mag_fill_slots : int
+        Repair for a magnetogram that never shares a grid slot with the continuum. Every
+        magnetogram quantity is averaged over a mask built from the continuum, so a frame
+        where only one of the two exists yields NaN. NOAA 11117 hits this hard: from
+        2010-10-30 its continuum runs at 720 s on even slots and its magnetogram at 720 s
+        on **odd** slots, 360 s apart, so ``mean_mag_*`` is NaN for the entire last day
+        while ``mean_dop_*`` is fine — the data is there, it is just interleaved.
+
+        Setting this to *n* fills each empty magnetogram slot from the nearest magnetogram
+        frame within *n* slots. Off by default because it fabricates a coincidence that the
+        observations do not have; ``data['mag_filled']`` marks every slot it invented.
+        ``mag_fill_slots=1`` shifts a frame by at most one grid step — for 11117 that is
+        360 s against a 720 s magnetogram cadence, half a frame, which is negligible for a
+        24 h signal but is not free at the Nyquist end. The real fix is to re-download that
+        region's last day on one clock.
     **region_kwargs : forwarded to `build_regions` — thresholds, cluster mode, mag_filter.
 
     Returns
@@ -642,6 +681,16 @@ def load_noaa_region(
     n_t = len(timestamps)
     present = {name: np.isfinite(cube).any(axis=(1, 2))
                for name, cube in [('cont', cube_cont), ('mag', cube_mag), ('dop', cube_dop)]}
+
+    # Every magnetogram quantity is averaged over a mask built from the *continuum*, so it
+    # needs both series in the same grid slot. NOAA 11117 stops providing that: from
+    # 2010-10-30 its continuum drops to 720 s on even slots while its magnetogram sits on
+    # 720 s odd slots, 360 s apart, so they never coincide again and mean_mag_* is NaN for
+    # the whole last day even though both cubes have data throughout.
+    mag_filled = np.zeros(n_t, dtype=bool)
+    if mag_fill_slots:
+        mag_filled = _fill_nearest_frames(cube_mag, present['mag'], mag_fill_slots)
+        present['mag'] = present['mag'] | mag_filled
 
     regions = build_regions(cube_cont, cube_mag, **region_kwargs)
 
@@ -670,7 +719,7 @@ def load_noaa_region(
         cube_mag_qsun=_mean_series(cube_mag, qsun).reshape(n_t, 1, 1),
         cube_dop_qsun=_mean_series(cube_dop, qsun).reshape(n_t, 1, 1),
         time_h=seconds / 3600, n_t=n_t, cadence_s=cadence_s,
-        timestamps=timestamps, present=present,
+        timestamps=timestamps, present=present, mag_filled=mag_filled,
         c_mean=c_mean, doppler_terms=doppler_terms,
         **{k: regions[k] for k in (
             'umbra', 'penumbra', 'both', 'hot_spot', 'qsun', 'i_qs', 'cluster_info',
