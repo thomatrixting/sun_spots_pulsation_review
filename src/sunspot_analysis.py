@@ -65,6 +65,155 @@ def _keep_central_cluster(binary_img: np.ndarray, mode: str) -> np.ndarray:
     return (labeled == keep).astype(binary_img.dtype)
 
 
+#: Components smaller than this many pixels are discarded before a spot is chosen.
+#: The penumbra threshold (0.90 I_qs) sits around the 8th percentile of a quiet-sun box, so
+#: it catches the dark tail of granulation as well as the spot: a single NOAA 11536 frame
+#: labels into ~160 components, ~150 of them under 50 px and totalling ~950 px of speckle.
+#: At HMI's 0.5 arcsec/px, 50 px is a blob about 7 px across — well under a real pore
+#: (2-5 Mm, i.e. 30-150 px), so this removes noise without touching solar structure. It
+#: also stops the "largest" component percolating through the speckle field and merging
+#: spots that are not actually connected.
+MIN_CLUSTER_PX = 50
+
+
+def select_spot_cluster(
+    footprint: np.ndarray,
+    mode: str = 'largest',
+    track: bool = True,
+    connectivity: int = 2,
+    min_area: int = MIN_CLUSTER_PX,
+) -> tuple[np.ndarray, dict]:
+    """Keep one connected sunspot per frame out of a whole cube's thresholded footprint.
+
+    Thresholding a continuum frame selects *every* dark pixel in the box — the target spot,
+    the other members of the group, pores, and bad pixels. The area of that mask then moves
+    for reasons that have nothing to do with the spot being measured: NOAA 11117's umbra
+    area drifts 98% across its window, and every mean taken over the mask inherits that.
+    Labelling the footprint into connected components and keeping one of them measures a
+    sunspot instead of a box.
+
+    Why the *combined* footprint (umbra | penumbra) rather than each mask separately, which
+    is what `_keep_central_cluster` is used for in `masks_from_cubes`: a sunspot is one
+    connected dark region with its umbra nested inside its penumbra, so the combined mask is
+    the thing that has one blob per spot. Labelling umbra and penumbra independently can
+    pick the largest umbra from one spot and the largest penumbra from another. Intersect
+    afterwards instead — ``umbra & spot``, ``penumbra & spot``.
+
+    Not k-means, deliberately: k-means clusters pixels in some feature space and has no
+    notion of spatial connectedness, so it will happily merge two separate spots into one
+    cluster and split one spot in half. Connected-component labelling is the operation that
+    means "these pixels are the same spot".
+
+    Parameters
+    ----------
+    footprint : ndarray, (n_t, ny, nx) bool
+        The combined umbra|penumbra mask for every frame.
+    mode : {'largest', 'central'}
+        How the target is chosen in the first frame, and whenever tracking loses it:
+        by area, or by centroid distance to the frame centre. 'central' is meaningful
+        because `locate_ar_window` centres the cutout on the catalogue centroid.
+    track : bool
+        Follow the same spot from frame to frame by maximum pixel overlap with the previous
+        selection, rather than re-running `mode` independently each time. Two comparable
+        spots make plain 'largest' flip between them mid-window, which puts a step in every
+        series — the exact artifact this function exists to remove.
+    connectivity : {1, 2}
+        1 = 4-connectivity, 2 = 8-connectivity (default), so diagonally touching penumbral
+        pixels stay one blob.
+    min_area : int
+        Discard components below this many pixels before choosing — see `MIN_CLUSTER_PX`
+        for why this is not optional in practice. 0 disables it.
+
+    Returns
+    -------
+    (spot, info)
+        `spot` is a bool cube of the same shape, True only inside the selected component,
+        so ``spot`` is a subset of ``footprint`` by construction.
+        `info` holds per-frame `n_clusters` (after the `min_area` cut), `area`, `fraction`
+        (selected / total footprint), `centroid` (n_t, 2) and `switched`. **Look at
+        `switched` and `fraction`.** Tracking losing the spot is the one way this makes
+        things worse, and it is invisible in the masks themselves.
+
+    Notes
+    -----
+    `fraction` is deliberately measured against the *whole* footprint, speckle included, so
+    it stays an honest "how much of the dark area is this spot" rather than flattering
+    itself by excluding what `min_area` already threw away.
+
+    A `switched` frame is not automatically a bug. On NOAA 11536 the spot decays from 473
+    to 18 px across a 4-day window, and the tracker re-picks once at the very end when
+    there is essentially nothing left to track. Check *when* it happened before treating it
+    as one.
+    """
+    if mode not in ('largest', 'central'):
+        raise ValueError(f"mode must be 'largest' or 'central', got {mode!r}")
+
+    footprint = np.asarray(footprint, dtype=bool)
+    n_t = footprint.shape[0]
+    structure = ndimage.generate_binary_structure(2, connectivity)
+    centre = np.array(footprint.shape[1:]) / 2
+
+    spot = np.zeros_like(footprint)
+    info = dict(
+        n_clusters=np.zeros(n_t, dtype=int),
+        area=np.zeros(n_t, dtype=int),
+        fraction=np.full(n_t, np.nan),
+        centroid=np.full((n_t, 2), np.nan),
+        switched=np.zeros(n_t, dtype=bool),
+    )
+
+    # The tracking reference is the last frame in which something was actually selected,
+    # not literally t-1: a NaN gap frame selects nothing and must not break the chain.
+    previous = None
+
+    for t in range(n_t):
+        frame = footprint[t]
+        if not frame.any():
+            continue
+
+        labeled, n = ndimage.label(frame, structure=structure)
+        if n == 0:
+            continue
+        labels = np.arange(1, n + 1)
+        sizes = ndimage.sum_labels(frame, labeled, labels)
+
+        if min_area:
+            big = sizes >= min_area
+            if not big.any():
+                continue                        # nothing here but speckle
+            labels, sizes = labels[big], sizes[big]
+            # Blank the discarded components so overlap and centroids ignore them too.
+            labeled = np.where(np.isin(labeled, labels), labeled, 0)
+        info['n_clusters'][t] = len(labels)
+
+        keep = None
+        if track and previous is not None:
+            # Overlap of every label with the previous selection, in one pass.
+            overlap = np.bincount(labeled[previous].ravel(), minlength=n + 1)
+            overlap[0] = 0                      # label 0 is background
+            if overlap.max() > 0:
+                keep = int(overlap.argmax())
+            else:
+                info['switched'][t] = True      # lost it — fall through to `mode`
+
+        if keep is None:
+            if mode == 'largest':
+                keep = int(labels[np.argmax(sizes)])
+            else:
+                centroids = ndimage.center_of_mass(frame, labeled, labels)
+                dists = [np.hypot(y - centre[0], x - centre[1]) for y, x in centroids]
+                keep = int(labels[np.argmin(dists)])
+
+        selected = labeled == keep
+        spot[t] = selected
+        info['area'][t] = int(selected.sum())
+        info['fraction'][t] = info['area'][t] / frame.sum()
+        info['centroid'][t] = ndimage.center_of_mass(selected)
+        previous = selected
+
+    return spot, info
+
+
 def _fft(ts: np.ndarray, cadence_s: float) -> tuple[np.ndarray, np.ndarray]:
     """Return (f_mhz, amplitude) skipping the DC component."""
     ts_c = np.array(ts, dtype=float)
@@ -288,12 +437,162 @@ def masks_from_cubes(
     )
 
 
+DEFAULT_HOTSPOT_G = 500.0
+
+
+def build_regions(
+    cube_cont: np.ndarray,
+    cube_mag: np.ndarray | None = None,
+    umbra_frac: float = 0.60,
+    penumbra_frac: float = 0.90,
+    qsun_percentile: int = 80,
+    cluster_mode: str | None = 'largest',
+    cluster_track: bool = True,
+    cluster_min_area: int = MIN_CLUSTER_PX,
+    mag_filter: Callable[[np.ndarray], np.ndarray] | None = None,
+    hotspot_gauss: float = DEFAULT_HOTSPOT_G,
+) -> dict:
+    """Segment a continuum cube into umbra / penumbra / hot spot / quiet sun.
+
+    This is the analysis-side counterpart to the corrections in
+    ``notebooks/02A_data_procesing.ipynb``: 02A produces the three corrected cubes and stops,
+    and everything here is re-derivable from them at any time. That split exists so that
+    retuning a threshold or a tracker means re-running 03A only — 02A costs ~90 s per region
+    because the limb-darkening and Doppler corrections re-read every per-frame FITS header,
+    and none of that work depends on where the umbra boundary is drawn.
+
+    Thresholds are fractions of each frame's **own** quiet-sun intensity, not absolute DN
+    (which is what `masks_from_cubes` takes, for the DS0X path). An absolute cut makes the
+    mask areas drift as the region rotates, and for a near-limb region the whole frame can
+    fall under a fixed penumbra cut.
+
+    Parameters
+    ----------
+    cube_cont : ndarray, (n_t, ny, nx)
+        Limb-darkening-corrected continuum, as 02A writes it.
+    cube_mag : ndarray, optional
+        Plane-corrected magnetogram. Needed only for the hot spot; without it `hot_spot`
+        comes back None.
+    umbra_frac, penumbra_frac : float
+        ``I < frac * I_qs``. Penumbra additionally excludes umbra.
+    qsun_percentile : int
+        Percentile of the frame's finite pixels used as its ``I_qs``.
+    cluster_mode : {'largest', 'central', None}
+        Restrict umbra/penumbra to one connected sunspot — see `select_spot_cluster`. None
+        keeps every dark pixel in the box, other spots and pores included.
+    mag_filter : callable, optional
+        ``B -> bool`` for the hot spot. Defaults to ``|B| > hotspot_gauss``, on ``|B|``
+        rather than signed B because getting the sign wrong yields an *empty* mask rather
+        than an error.
+
+    Returns
+    -------
+    dict
+        ``umbra``, ``penumbra``, ``both``, ``hot_spot``, ``qsun`` bool cubes; ``i_qs``;
+        ``cluster_info`` (or None); ``raw_area_px`` for the footprint before the cluster
+        selection; and ``umbra_thresh`` / ``penumbra_thresh``, the median absolute DN the
+        fractional cuts worked out to, which the plot legends quote.
+
+    Notes
+    -----
+    Every step is NaN-safe, because a gap frame on 02A's uniform time grid is entirely NaN:
+    the percentile guards on there being finite pixels, and a comparison against a NaN
+    threshold is False, so a gap frame simply gets empty masks.
+
+    **Quiet sun is the complement of the raw footprint, deliberately** — computed before the
+    cluster selection narrows things down. Otherwise every dark pixel the selection
+    discarded, a second sunspot's umbra included, would land in the quiet-sun mask and
+    contaminate the quiet-sun reference that everything downstream subtracts.
+    """
+    cube_cont = np.asarray(cube_cont)
+    n_t = cube_cont.shape[0]
+
+    finite = np.isfinite(cube_cont)
+    i_qs = np.array([np.percentile(cube_cont[t][finite[t]], qsun_percentile)
+                     if finite[t].any() else np.nan for t in range(n_t)])
+
+    with np.errstate(invalid='ignore'):
+        raw_umbra = (cube_cont < (umbra_frac * i_qs)[:, None, None]) & finite
+        raw_pen   = (cube_cont < (penumbra_frac * i_qs)[:, None, None]) & finite & ~raw_umbra
+    raw_both = raw_umbra | raw_pen
+
+    qsun = finite & ~raw_both
+
+    cluster_info = None
+    if cluster_mode:
+        spot, cluster_info = select_spot_cluster(
+            raw_both, mode=cluster_mode, track=cluster_track, min_area=cluster_min_area)
+        umbra, penumbra, both = raw_umbra & spot, raw_pen & spot, spot
+    else:
+        umbra, penumbra, both = raw_umbra, raw_pen, raw_both
+
+    hot_spot = None
+    if cube_mag is not None:
+        if mag_filter is None:
+            def mag_filter(b):
+                return np.abs(b) > hotspot_gauss
+        with np.errstate(invalid='ignore'):
+            hot_spot = mag_filter(cube_mag) & both
+
+    return dict(
+        umbra=umbra, penumbra=penumbra, both=both, hot_spot=hot_spot, qsun=qsun,
+        i_qs=i_qs, cluster_info=cluster_info,
+        raw_area_px={'umbra': raw_umbra.reshape(n_t, -1).sum(axis=1),
+                     'penumbra': raw_pen.reshape(n_t, -1).sum(axis=1),
+                     'both': raw_both.reshape(n_t, -1).sum(axis=1)},
+        umbra_thresh=float(np.nanmedian(i_qs) * umbra_frac),
+        penumbra_thresh=float(np.nanmedian(i_qs) * penumbra_frac),
+        cluster_mode=cluster_mode, umbra_frac=umbra_frac, penumbra_frac=penumbra_frac,
+    )
+
+
+#: Bit values of the mask cube `write_masks_cube` produces, also written as BIT_* keywords.
+BIT_UMBRA, BIT_PENUMBRA, BIT_HOTSPOT = 1, 2, 4
+
+
+def write_masks_cube(data: dict, path, header=None, history=None):
+    """Write the regions in `data` as one ``uint8`` bitmask cube, for DS9.
+
+    A single integer cube rather than three float ones: DS9 renders integers far more
+    cleanly, and one file keeps the overlapping hot spot alongside the regions it sits
+    inside. The bit values and threshold fractions go in as keywords rather than as a
+    convention, so a reader gets what was actually used instead of assuming defaults.
+
+    This is an **export**, not an input. `load_noaa_region` rebuilds the masks from the
+    cubes every time rather than reading this file, so it can never go stale against the
+    thresholds currently set in the notebook.
+    """
+    from src.utilities import write_cube
+
+    masks = (data['umbra'].astype(np.uint8) * BIT_UMBRA
+             | data['penumbra'].astype(np.uint8) * BIT_PENUMBRA)
+    if data.get('hot_spot') is not None:
+        masks |= data['hot_spot'].astype(np.uint8) * BIT_HOTSPOT
+
+    header = fits.Header() if header is None else header.copy()
+    header['BUNIT']    = ('', 'bit flags, see BIT_* keywords')
+    header['BIT_UMB']  = (BIT_UMBRA, 'bit value for umbra')
+    header['BIT_PEN']  = (BIT_PENUMBRA, 'bit value for penumbra')
+    header['BIT_HOT']  = (BIT_HOTSPOT, 'bit value for hot spot')
+    header['UMB_FRAC'] = (data.get('umbra_frac', np.nan), 'umbra threshold / I_qs')
+    header['PEN_FRAC'] = (data.get('penumbra_frac', np.nan), 'penumbra threshold / I_qs')
+    header['CLUSTER']  = (data.get('cluster_mode') or 'none', 'connected-component selection')
+
+    return write_cube(masks, path, header=header, timestamps=data.get('timestamps'),
+                      history=list(history or []) + [
+                          '03A: 0 = quiet sun; bits overlap (hot spot is inside the spot)',
+                          '03A: 0 also covers dark pixels outside the selected spot - '
+                          'they are NOT quiet sun',
+                          '03A: a gap frame has every bit 0'])
+
+
 def load_noaa_region(
     processed_dir: str | pathlib.Path,
     region: str = 'region_01',
+    **region_kwargs,
 ) -> dict:
     """
-    Build the ``load_and_mask``-style data dict from the corrected cubes that
+    Build the ``load_and_mask``-style data dict from the three corrected cubes that
     ``notebooks/02A_data_procesing.ipynb`` writes for a NOAA region.
 
     This is the bridge between the NOAA pipeline and everything in this module: the
@@ -301,34 +600,36 @@ def load_noaa_region(
     ``plot_time_series``, ``plot_area``, ``plot_ffts_*`` and ``save_animation`` exactly
     like a ``load_and_mask`` result for a DS0X directory.
 
-    The differences from ``load_and_mask``, all handled here:
+    **Masks are rebuilt here, every time, by `build_regions`** — never read from disk, even
+    when a mask cube happens to sit next to the data. That is the whole point of the split:
+    what gets analysed is always what the current ``region_kwargs`` produce, so a stale mask
+    file can never silently drive the analysis, and retuning a threshold costs one 03A run
+    instead of a full 02A re-correction.
 
-    - **Masks are read, not re-derived.** 02A thresholds each frame against its own
-      quiet-sun intensity; re-deriving them here with the absolute ``umbra_thresh`` /
-      ``penumbra_thresh`` of ``masks_from_cubes`` would give different regions than the
-      ones the saved cubes were corrected against. They come out of the ``uint8`` bitmask
-      cube instead, hot spot included.
-    - **No quiet-sun patch cubes exist** for these regions. ``compute_metrics`` only ever
-      takes ``np.nanmean(cube_qsun[t])`` of them, so the per-frame quiet-sun means saved
-      by 02A are reshaped to ``(n_t, 1, 1)`` rather than materialising two full cubes.
-    - **Cadence is measured, not assumed.** It is taken as the median timestamp spacing —
-      NOAA 11117 is sampled at ~360 s while the other regions are at 720 s, so a fixed
-      cadence would put its FFT frequency axis out by a factor of two.
-    - **Gap frames are flagged.** 02A puts the three series on a uniform grid and NaN-fills
-      the slots a series has no frame for, recording which those are in the qsun table's
-      ``PRESENT_*`` columns. They are read back into ``data['present']`` because the mask
-      cube is ``uint8`` and cannot hold a NaN: without the flags, a gap frame's empty masks
-      are indistinguishable from a frame in which the spot was not detected. Cubes written
-      before those columns existed simply come back with ``present=None``.
+    The other differences from ``load_and_mask``:
+
+    - **Gap frames are derived, not stored.** A frame that a series was missing is entirely
+      NaN on 02A's uniform time grid, so ``present`` is just
+      ``np.isfinite(cube).any(axis=(1, 2))`` per series — exact, and one less thing to keep
+      in sync.
+    - **No quiet-sun patch cubes exist** for these regions, so the ``cube_*_qsun`` entries
+      are the per-frame spatial means over the quiet-sun mask, shaped ``(n_t, 1, 1)``, which
+      is all ``compute_metrics`` ever takes of them.
+    - **Cadence is measured, not assumed.** Median timestamp spacing — NOAA 11117 is sampled
+      at ~360 s while the others are at 720 s, so a fixed cadence would put its FFT
+      frequency axis out by a factor of two.
 
     Parameters
     ----------
     processed_dir : path to ``data/processed/NOAA_<noaa>_<date>/``
     region        : region prefix within that directory (default ``'region_01'``)
+    **region_kwargs : forwarded to `build_regions` — thresholds, cluster mode, mag_filter.
 
     Returns
     -------
-    dict with the same keys as ``masks_from_cubes``, plus ``timestamps`` and ``present``.
+    dict with the same keys as ``masks_from_cubes``, plus ``timestamps``, ``present``,
+    ``i_qs``, ``cluster_info``, and ``c_mean`` / ``doppler_terms`` when 02A's per-frame
+    diagnostics table is present beside the cubes.
     """
     from src.utilities import read_cube
 
@@ -337,52 +638,44 @@ def load_noaa_region(
     cube_cont, timestamps = read_cube(processed_dir / f'{region}_continuum_cube.fits')
     cube_mag, _ = read_cube(processed_dir / f'{region}_magnetogram_corrected_cube.fits')
     cube_dop, _ = read_cube(processed_dir / f'{region}_dopplergram_calibrated_cube.fits')
-    masks_path = processed_dir / f'{region}_masks_cube.fits'
-    bitmask, _ = read_cube(masks_path)
-
-    header = fits.getheader(masks_path)
-    bit_umb = header.get('BIT_UMB', 1)
-    bit_pen = header.get('BIT_PEN', 2)
-    bit_hot = header.get('BIT_HOT', 4)
-    umb_frac = header.get('UMB_FRAC', 0.60)
-    pen_frac = header.get('PEN_FRAC', 0.90)
-
-    umbra    = (bitmask & bit_umb).astype(bool)
-    penumbra = (bitmask & bit_pen).astype(bool)
-    hot_spot = (bitmask & bit_hot).astype(bool)
-    both     = umbra | penumbra
-
-    with fits.open(processed_dir / f'{region}_qsun_means.fits') as hdul:
-        qsun = hdul['QSUN'].data
-        columns  = qsun.columns.names
-        mag_qsun = np.asarray(qsun['MEAN_MAG_QSUN'], dtype=float)
-        dop_qsun = np.asarray(qsun['MEAN_DOP_QSUN'], dtype=float)
-        i_qs     = np.asarray(qsun['I_QS'], dtype=float)
-        c_mean   = (np.asarray(qsun['C_MEAN'], dtype=float)
-                    if 'C_MEAN' in columns else None)
-        # Written by 02A since the uniform-grid join; absent from older cubes, which had
-        # no gap frames to describe because the join dropped them instead.
-        present = ({name: np.asarray(qsun[f'PRESENT_{name.upper()}'], dtype=bool)
-                    for name in ('cont', 'mag', 'dop')}
-                   if 'PRESENT_CONT' in columns else None)
 
     n_t = len(timestamps)
+    present = {name: np.isfinite(cube).any(axis=(1, 2))
+               for name, cube in [('cont', cube_cont), ('mag', cube_mag), ('dop', cube_dop)]}
+
+    regions = build_regions(cube_cont, cube_mag, **region_kwargs)
+
+    # 02A's per-frame correction diagnostics. Optional on purpose: cubes written before this
+    # table existed still load, they just have nothing to report about the corrections.
+    c_mean, doppler_terms = None, None
+    frames_path = processed_dir / f'{region}_frames.fits'
+    if frames_path.exists():
+        with fits.open(frames_path) as hdul:
+            frames = hdul['FRAMES'].data
+            names = frames.columns.names
+        if 'C_MEAN' in names:
+            c_mean = np.asarray(frames['C_MEAN'], dtype=float)
+        terms = {k.lower()[2:]: np.asarray(frames[k], dtype=float)
+                 for k in ('V_SDO', 'V_LSF', 'V_CLV', 'V_GRAVITY') if k in names}
+        doppler_terms = terms or None
+
     seconds = np.array([(t - timestamps[0]).total_seconds() for t in timestamps])
     gaps = np.diff(seconds)
     cadence_s = float(np.median(gaps)) if gaps.size else np.nan
 
+    qsun = regions['qsun']
     return dict(
         cube_cont=cube_cont, cube_mag=cube_mag, cube_dop=cube_dop,
-        # Shaped (n_t, 1, 1) so np.nanmean(cube[t]) returns the saved per-frame mean.
-        cube_dop_qsun=dop_qsun.reshape(n_t, 1, 1),
-        cube_mag_qsun=mag_qsun.reshape(n_t, 1, 1),
-        umbra=umbra, penumbra=penumbra, both=both, hot_spot=hot_spot,
+        # Shaped (n_t, 1, 1) so np.nanmean(cube[t]) returns that frame's quiet-sun mean.
+        cube_mag_qsun=_mean_series(cube_mag, qsun).reshape(n_t, 1, 1),
+        cube_dop_qsun=_mean_series(cube_dop, qsun).reshape(n_t, 1, 1),
         time_h=seconds / 3600, n_t=n_t, cadence_s=cadence_s,
-        timestamps=timestamps, present=present, i_qs=i_qs, c_mean=c_mean,
-        # plot_magnetogram_masks uses these only for its legend text. Report the absolute
-        # DN the fractional cut actually worked out to, so the label stays truthful.
-        umbra_thresh=float(np.nanmedian(i_qs) * umb_frac),
-        penumbra_thresh=float(np.nanmedian(i_qs) * pen_frac),
+        timestamps=timestamps, present=present,
+        c_mean=c_mean, doppler_terms=doppler_terms,
+        **{k: regions[k] for k in (
+            'umbra', 'penumbra', 'both', 'hot_spot', 'qsun', 'i_qs', 'cluster_info',
+            'raw_area_px', 'umbra_thresh', 'penumbra_thresh', 'cluster_mode',
+            'umbra_frac', 'penumbra_frac')},
     )
 
 
@@ -892,6 +1185,274 @@ def plot_area(
     ax.legend()
     plt.tight_layout()
     _savefig(fig, plots_dir if save else None, 'area_vs_time.png')
+    plt.show()
+    plt.close(fig)
+
+
+# ── phase 3: the 24 h oscillation ─────────────────────────────────────────────
+
+#: Period of the oscillation `fit_diurnal` looks for, in hours.
+DIURNAL_PERIOD_H = 24.0
+
+
+def fit_diurnal(
+    time_h: np.ndarray,
+    series: np.ndarray,
+    window: tuple[float, float] | None = None,
+    period_h: float = DIURNAL_PERIOD_H,
+    mask: np.ndarray | None = None,
+    label: str = '',
+) -> dict:
+    """Fit ``c + a sin(2 pi t / P) + b cos(2 pi t / P)`` over a stretch of the series.
+
+    The period is **fixed**, which is what makes this worth doing at all: with `P` held at
+    24 h the model is linear in ``(c, a, b)``, so it is one `np.linalg.lstsq` with an exact
+    answer — no initial guess, no convergence failure, no local minimum. Fitting
+    ``A sin(2 pi t / P + phi) + c`` with `scipy.optimize.curve_fit` describes the same
+    curve but has to be started somewhere and can fail; the amplitude and phase come out of
+    the linear fit anyway as ``hypot(a, b)`` and ``atan2(b, a)``.
+
+    Parameters
+    ----------
+    time_h : ndarray
+        Elapsed hours, i.e. ``data['time_h']``. Zero is the first frame of the cube.
+    series : ndarray
+        The quantity to fit, same length. NaNs (gap frames, empty masks) are dropped.
+    window : (float, float), optional
+        ``(t_start, t_end)`` in hours, inclusive of both ends. Default: the whole series.
+    period_h : float
+        The period to fit. Changing it changes what the "amplitude" means, so it is
+        recorded in the result.
+    mask : ndarray of bool, optional
+        Extra points to exclude. Pass a mask shared between two series so their fits are
+        directly comparable — see the note on the instrumental control below.
+    label : str
+        Used only in the warning messages, so a marginal fit can be traced to its region.
+
+    Returns
+    -------
+    dict
+        ``intercept``, ``amplitude``, ``phase_rad``, ``t_max`` (hours after the window
+        start at which the fitted curve peaks), the matching ``sigma_intercept`` /
+        ``sigma_amplitude``, ``n`` points used, ``rms_residual``, ``period_h`` and
+        ``window``. Every numeric field is NaN when there was too little data, rather than
+        raising, so one thin window cannot abort a loop over regions.
+
+    Notes
+    -----
+    **Read the uncertainty, not just the amplitude.** Over a window one period long the
+    sinusoid completes exactly one cycle, and amplitude, phase and intercept are then only
+    weakly separated — they trade against each other and `sigma_amplitude` is what says so.
+    A window of 1.5 periods or more is much better constrained; below that this warns.
+
+    **24 h is also the period of the instrument.** SDO's line-of-sight velocity is
+    dominated by ``OBS_VR``, which varies diurnally with its geosynchronous orbit, so any
+    residual of the ``v_SDO`` correction in `src/doppler_calibration.py` lands at exactly
+    the period fitted here. Because this fit is linear, fitting ``umbra - quiet_sun`` gives
+    coefficients *exactly* equal to the umbral fit's minus the quiet sun's, provided both
+    used the same points — which is what `mask` is for. Comparing the two amplitudes is
+    therefore the control: close together means the signal is umbral, an absolute amplitude
+    much larger than the quiet-subtracted one means most of it is common to the whole box.
+    """
+    time_h = np.asarray(time_h, dtype=float)
+    series = np.asarray(series, dtype=float)
+    window = (float(time_h.min()), float(time_h.max())) if window is None else (
+        float(window[0]), float(window[1]))
+
+    inside = (time_h >= window[0]) & (time_h <= window[1]) & np.isfinite(series)
+    if mask is not None:
+        inside &= np.asarray(mask, dtype=bool)
+    n = int(inside.sum())
+    # Three free parameters, so four points is the minimum that leaves anything to check
+    # the fit against. `n` is reported even when the fit is refused, so the table says how
+    # close the window came rather than a bare zero.
+    if n < 4:
+        warnings.warn(f'fit_diurnal{f" [{label}]" if label else ""}: only {n} finite '
+                      f'point(s) in {window[0]:g}-{window[1]:g} h — no fit', stacklevel=2)
+        return dict(intercept=np.nan, amplitude=np.nan, phase_rad=np.nan, t_max=np.nan,
+                    sigma_intercept=np.nan, sigma_amplitude=np.nan, n=n,
+                    rms_residual=np.nan, period_h=period_h, window=window,
+                    coefficients=np.full(3, np.nan))
+
+    span = window[1] - window[0]
+    if span < 1.5 * period_h:
+        warnings.warn(
+            f'fit_diurnal{f" [{label}]" if label else ""}: the {span:g} h window is only '
+            f'{span / period_h:.2f} periods long. Amplitude, phase and intercept are '
+            f'poorly separated over so little of a cycle — read sigma_amplitude before '
+            f'reading amplitude.', stacklevel=2)
+
+    t, y = time_h[inside], series[inside]
+    omega = 2 * np.pi / period_h
+    design = np.column_stack([np.ones(n), np.sin(omega * t), np.cos(omega * t)])
+
+    coef, *_ = np.linalg.lstsq(design, y, rcond=None)
+    c, a, b = coef
+    residual = y - design @ coef
+    amplitude = float(np.hypot(a, b))
+
+    # Parameter covariance the textbook way: residual variance times inv(X'X). With only
+    # as many points as parameters there is no residual left to estimate it from.
+    dof = n - 3
+    if dof > 0:
+        var = float(residual @ residual) / dof
+        cov = var * np.linalg.pinv(design.T @ design)
+        sigma_c = float(np.sqrt(max(cov[0, 0], 0.0)))
+        # sigma_A^2 = (a^2 var_a + b^2 var_b + 2 a b cov_ab) / A^2
+        sigma_a2 = (a * a * cov[1, 1] + b * b * cov[2, 2] + 2 * a * b * cov[1, 2])
+        sigma_amp = float(np.sqrt(max(sigma_a2, 0.0)) / amplitude) if amplitude > 0 else np.nan
+    else:
+        sigma_c = sigma_amp = np.nan
+
+    # Where the fitted curve peaks. a sin + b cos peaks where omega t = atan2(a, b), which
+    # is easier to read against the plot than a phase offset in radians.
+    phase = float(np.arctan2(b, a))
+    t_peak = float(np.arctan2(a, b) / omega)
+    t_max = window[0] + (t_peak - window[0]) % period_h
+
+    return dict(
+        intercept=float(c), amplitude=amplitude, phase_rad=phase, t_max=t_max,
+        sigma_intercept=sigma_c, sigma_amplitude=sigma_amp, n=n,
+        rms_residual=float(np.sqrt(np.mean(residual ** 2))),
+        period_h=period_h, window=window, coefficients=coef,
+    )
+
+
+def diurnal_curve(fit: dict, time_h: np.ndarray) -> np.ndarray:
+    """Evaluate a `fit_diurnal` result at arbitrary times, for plotting over the data."""
+    c, a, b = fit['coefficients']
+    omega = 2 * np.pi / fit['period_h']
+    t = np.asarray(time_h, dtype=float)
+    return c + a * np.sin(omega * t) + b * np.cos(omega * t)
+
+
+def plot_diurnal_fits(
+    rows: list[dict],
+    series_key: str = 'fit_rel',
+    save: bool = False,
+    plots_dir: str | pathlib.Path | None = None,
+) -> None:
+    """One panel per fitted row: the data, the window, and the fitted curve.
+
+    This is the check that has to happen *before* reading anything off the amplitude
+    scatter. A fit that latched onto a download gap, a segmentation step or a slow trend
+    still produces a perfectly respectable-looking number; the only way to catch it is to
+    look at the curve sitting on the points.
+
+    Parameters
+    ----------
+    rows : list of dict
+        As built by the fitting cell of 03A: each needs ``label``, ``time_h``, ``series``
+        (or ``series_rel``), the fit under `series_key`, and ``window``.
+    series_key : {'fit_rel', 'fit_abs'}
+        Which of the two fits to draw. The series drawn alongside matches it.
+    """
+    rows = [r for r in rows if np.isfinite(r[series_key]['amplitude'])]
+    if not rows:
+        print('plot_diurnal_fits: nothing to draw — every fit failed')
+        return
+
+    value_key = 'series_rel' if series_key == 'fit_rel' else 'series'
+    ylabel = ('Umbra − quiet sun  (m/s)' if series_key == 'fit_rel'
+              else 'Umbra, absolute  (m/s)')
+
+    n_cols = min(2, len(rows))
+    n_rows = int(np.ceil(len(rows) / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6.5 * n_cols, 3.2 * n_rows),
+                             squeeze=False)
+
+    for ax, row in zip(axes.ravel(), rows):
+        fit = row[series_key]
+        t, y = row['time_h'], row[value_key]
+        t0, t1 = fit['window']
+
+        # The whole series in grey for context, the fitted stretch on top of it — so a
+        # window that sits on an unrepresentative piece of the record is obvious.
+        ax.plot(t, y, color='0.8', lw=0.7, zorder=1)
+        inside = (t >= t0) & (t <= t1)
+        ax.plot(t[inside], y[inside], color='steelblue', lw=0.9, zorder=2, label='umbra')
+
+        dense = np.linspace(t0, t1, 400)
+        ax.plot(dense, diurnal_curve(fit, dense), color='crimson', lw=1.8, zorder=3,
+                label=f'{fit["period_h"]:g} h fit')
+        ax.axhline(fit['intercept'], color='crimson', lw=0.8, ls=':', zorder=3)
+        ax.axvspan(t0, t1, color='gold', alpha=0.12, zorder=0)
+
+        ax.set_title(f'{row["label"]}   A = {fit["amplitude"]:.1f} ± '
+                     f'{fit["sigma_amplitude"]:.1f} m/s   (n = {fit["n"]})', fontsize=10)
+        ax.set_xlabel('Time  (h)')
+        ax.set_ylabel(ylabel)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=7, loc='upper right')
+
+    for ax in axes.ravel()[len(rows):]:
+        ax.set_visible(False)
+
+    plt.tight_layout()
+    _savefig(fig, plots_dir if save else None, f'diurnal_{series_key}.png')
+    plt.show()
+    plt.close(fig)
+
+
+def plot_amplitude_vs_depression(
+    rows: list[dict],
+    depth_key: str = 'z_div',
+    save: bool = False,
+    plots_dir: str | pathlib.Path | None = None,
+    normalize_area = False
+) -> None:
+    """Fitted 24 h amplitude against the Wilson depression reported for each region.
+
+    Both fitted series are drawn: the absolute umbral velocity and the same thing with the
+    quiet sun subtracted. That pair is the instrumental control — see `fit_diurnal`'s
+    notes. If the two markers for a region sit on top of each other the oscillation is
+    umbral; if the absolute one is far higher, most of that amplitude is common to the
+    whole box and is more likely a residual of the diurnal ``v_SDO`` correction than a
+    property of the sunspot.
+
+    Pearson r is annotated per series, with the number of points it was computed from.
+    With five points it is a description of this sample, not evidence of a relationship.
+    """
+    usable = [r for r in rows if np.isfinite(r['fit_rel']['amplitude'])
+              and np.isfinite(r[depth_key])]
+    if len(usable) < 2:
+        print(f'plot_amplitude_vs_depression: only {len(usable)} usable point(s)')
+        return
+
+    depth_label = {'z_div': r'$z_{W,\mathrm{div}}$', 'z_press': r'$z_{W,\mathrm{press}}$'}
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    for key, color, marker, name in [
+            ('fit_abs', 'darkorange', 'o', 'Umbra, absolute'),
+            ('fit_rel', 'steelblue', 's', 'Umbra − quiet sun')]:
+        x = np.array([r[depth_key] for r in usable], dtype=float)
+
+        if normalize_area:
+            y = np.array([r[key]['amplitude'] / r['area'] for r in usable], dtype=float)
+        else:
+            y = np.array([r[key]['amplitude'] for r in usable], dtype=float)
+        e = np.array([r[key]['sigma_amplitude'] for r in usable], dtype=float)
+        ax.errorbar(x, y, yerr=e, fmt=marker, color=color, ms=7, capsize=3, lw=0,
+                    elinewidth=1, label=name)
+
+        finite = np.isfinite(x) & np.isfinite(y)
+        if finite.sum() > 2:
+            r_p = float(np.corrcoef(x[finite], y[finite])[0, 1])
+            ax.plot([], [], ' ', label=f'   r = {r_p:+.2f}  (n = {int(finite.sum())})')
+
+    # Label each point once, next to the quiet-subtracted marker.
+    for row in usable:
+        ax.annotate(row['label'], (row[depth_key], row['fit_rel']['amplitude']),
+                    textcoords='offset points', xytext=(7, 4), fontsize=7, color='0.3')
+
+    period = usable[0]['fit_rel']['period_h']
+    ax.set_xlabel(f'Wilson depression {depth_label.get(depth_key, depth_key)}  (km)')
+    ax.set_ylabel(f'Fitted {period:g} h amplitude  (m/s)')
+    ax.set_title(f'{period:g} h umbral Doppler amplitude vs Wilson depression')
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    _savefig(fig, plots_dir if save else None, f'amplitude_vs_{depth_key}.png')
     plt.show()
     plt.close(fig)
 
