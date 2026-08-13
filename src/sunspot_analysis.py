@@ -451,6 +451,7 @@ def build_regions(
     cluster_min_area: int = MIN_CLUSTER_PX,
     mag_filter: Callable[[np.ndarray], np.ndarray] | None = None,
     hotspot_gauss: float = DEFAULT_HOTSPOT_G,
+    custom_valid_region: np.ndarray | None = None,
 ) -> dict:
     """Segment a continuum cube into umbra / penumbra / hot spot / quiet sun.
 
@@ -515,6 +516,17 @@ def build_regions(
         raw_umbra = (cube_cont < (umbra_frac * i_qs)[:, None, None]) & finite
         raw_pen   = (cube_cont < (penumbra_frac * i_qs)[:, None, None]) & finite & ~raw_umbra
     raw_both = raw_umbra | raw_pen
+
+    if custom_valid_region is not None:
+        custom_valid_region = np.asarray(custom_valid_region, dtype=bool)
+        if custom_valid_region.shape != cube_cont.shape[1:]:
+            raise ValueError(
+                f'custom_valid_region shape {custom_valid_region.shape} '
+                f'does not match cube_cont shape {cube_cont.shape[1:]}'
+            )
+        raw_umbra &= custom_valid_region
+        raw_pen   &= custom_valid_region
+        raw_both  &= custom_valid_region
 
     qsun = finite & ~raw_both
 
@@ -609,10 +621,55 @@ def _fill_nearest_frames(cube: np.ndarray, present: np.ndarray, max_slots: int):
     return filled
 
 
+def _raw_cube_on_grid(cube, times, grid, ref_shape, label: str):
+    """Place a cube read from ``data/raw/`` onto the processed cubes' time grid.
+
+    The two directories do not share a time axis and are not meant to: ``data/raw/`` holds
+    the frames that actually downloaded, while 02A writes ``data/processed/`` on a uniform
+    grid covering the *union* of the three series, with an all-NaN frame in every slot a
+    series had no frame for. NOAA 11106 is 452 raw frames against 480 grid slots. Indexing
+    one against the other is what raises ``operands could not be broadcast together`` —
+    and a plain truncation to the shorter length would be worse than the error, because
+    every frame after the first gap would sit one slot early and the 24 h fits would drift.
+
+    So the raw cube goes through the same `reindex_on_grid` join 02A used, which is a no-op
+    for a region whose raw cube is already complete.
+
+    A *spatial* mismatch is refused instead of repaired: it means 02A cropped this region
+    (`crop_to_common_window`, for a download box that changed mid-window) and the crop
+    offset is not recoverable from the raw cube alone.
+    """
+    from src.utilities import reindex_on_grid
+
+    if tuple(cube.shape[1:]) != tuple(ref_shape):
+        raise ValueError(
+            f'{label}: raw cube is {cube.shape[1]}x{cube.shape[2]} but the processed '
+            f'continuum is {ref_shape[0]}x{ref_shape[1]}. 02A cropped this region to its '
+            f'common data window and the raw cube is uncropped, so the two cannot be '
+            f'indexed against each other. Use the corrected magnetogram '
+            f'(raw_magnetogram=False), or re-run 02A for this region with crop_to_data '
+            f'off if you need the full box.')
+
+    seconds = np.array([(t - grid[0]).total_seconds() for t in grid])
+    cadence_s = float(np.median(np.diff(seconds))) if len(grid) > 1 else np.nan
+
+    out, present = reindex_on_grid(cube, times, grid, cadence_s)
+    if not present.all():
+        n = int((~present).sum())
+        warnings.warn(
+            f'{label}: {n} of {len(grid)} grid slots have no raw frame and are NaN '
+            f'(the raw cube has {len(times)} frames). Every quantity averaged over those '
+            f'slots is NaN by design — see mag_fill_slots.', stacklevel=3)
+    return out
+
+
 def load_noaa_region(
     processed_dir: str | pathlib.Path,
     region: str = 'region_01',
     mag_fill_slots: int = 0,
+    custom_valid_region: np.ndarray | None = None,
+    raw_magnetogram: bool  = False,
+    raw_dir: str | pathlib.Path = None,
     **region_kwargs,
 ) -> dict:
     """
@@ -662,6 +719,18 @@ def load_noaa_region(
         360 s against a 720 s magnetogram cadence, half a frame, which is negligible for a
         24 h signal but is not free at the Nyquist end. The real fix is to re-download that
         region's last day on one clock.
+    custom_valid_region : np.ndarray | None
+        A boolean mask for valid regions in the continuum cube.
+    raw_magnetogram : bool
+        Read the magnetogram from ``data/raw/`` instead of 02A's corrected cube — the field
+        as downloaded, with the quiet-sun plane still in it. For asking what the plane
+        subtraction did, not for analysis: the raw cube keeps HMI's instrumental offset and
+        the gradient across the box, so ``hotspot_gauss`` cuts at a different physical level
+        than it does on the corrected cube and the two hot-spot masks are not comparable.
+        Needs ``raw_dir``. The cube is reindexed onto the processed time grid on the way in
+        (`_raw_cube_on_grid`) — the raw and processed cubes have different frame counts.
+    raw_dir : path | None
+        This region's directory under ``data/raw/``, required when ``raw_magnetogram``.
     **region_kwargs : forwarded to `build_regions` — thresholds, cluster mode, mag_filter.
 
     Returns
@@ -675,7 +744,20 @@ def load_noaa_region(
     processed_dir = pathlib.Path(processed_dir)
 
     cube_cont, timestamps = read_cube(processed_dir / f'{region}_continuum_cube.fits')
-    cube_mag, _ = read_cube(processed_dir / f'{region}_magnetogram_corrected_cube.fits')
+    if raw_magnetogram:
+        if raw_dir is None:
+            raise ValueError(
+                "raw_magnetogram=True needs raw_dir — this region's directory under "
+                "data/raw/, e.g. "
+                "pathlib.Path(str(processed_dir).replace('/processed/', '/raw/'))")
+        raw_dir = pathlib.Path(raw_dir)
+        mag_path = raw_dir / f'{region}_magnetogram_cube.fits'
+        cube_mag, mag_times = read_cube(mag_path)
+        # 01A's cube is on the timestamps that downloaded, not on 02A's uniform grid.
+        cube_mag = _raw_cube_on_grid(cube_mag, mag_times, timestamps,
+                                     cube_cont.shape[1:], mag_path.name)
+    else:
+        cube_mag, _ = read_cube(processed_dir / f'{region}_magnetogram_corrected_cube.fits')
     cube_dop, _ = read_cube(processed_dir / f'{region}_dopplergram_calibrated_cube.fits')
 
     n_t = len(timestamps)
@@ -692,7 +774,7 @@ def load_noaa_region(
         mag_filled = _fill_nearest_frames(cube_mag, present['mag'], mag_fill_slots)
         present['mag'] = present['mag'] | mag_filled
 
-    regions = build_regions(cube_cont, cube_mag, **region_kwargs)
+    regions = build_regions(cube_cont, cube_mag, custom_valid_region=custom_valid_region, **region_kwargs)
 
     # 02A's per-frame correction diagnostics. Optional on purpose: cubes written before this
     # table existed still load, they just have nothing to report about the corrections.
