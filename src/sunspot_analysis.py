@@ -646,9 +646,9 @@ def _raw_cube_on_grid(cube, times, grid, ref_shape, label: str):
             f'{label}: raw cube is {cube.shape[1]}x{cube.shape[2]} but the processed '
             f'continuum is {ref_shape[0]}x{ref_shape[1]}. 02A cropped this region to its '
             f'common data window and the raw cube is uncropped, so the two cannot be '
-            f'indexed against each other. Use the corrected magnetogram '
-            f'(raw_magnetogram=False), or re-run 02A for this region with crop_to_data '
-            f'off if you need the full box.')
+            f'indexed against each other. Use 02A\'s corrected cube '
+            f'(raw_magnetogram=False / raw_dopplergram=False), or re-run 02A for this '
+            f'region with crop_to_data off if you need the full box.')
 
     seconds = np.array([(t - grid[0]).total_seconds() for t in grid])
     cadence_s = float(np.median(np.diff(seconds))) if len(grid) > 1 else np.nan
@@ -659,7 +659,7 @@ def _raw_cube_on_grid(cube, times, grid, ref_shape, label: str):
         warnings.warn(
             f'{label}: {n} of {len(grid)} grid slots have no raw frame and are NaN '
             f'(the raw cube has {len(times)} frames). Every quantity averaged over those '
-            f'slots is NaN by design — see mag_fill_slots.', stacklevel=3)
+            f'slots is NaN by design — see mag_fill_slots.', stacklevel=4)
     return out
 
 
@@ -669,6 +669,7 @@ def load_noaa_region(
     mag_fill_slots: int = 0,
     custom_valid_region: np.ndarray | None = None,
     raw_magnetogram: bool  = False,
+    raw_dopplergram: bool  = False,
     raw_dir: str | pathlib.Path = None,
     **region_kwargs,
 ) -> dict:
@@ -729,8 +730,17 @@ def load_noaa_region(
         than it does on the corrected cube and the two hot-spot masks are not comparable.
         Needs ``raw_dir``. The cube is reindexed onto the processed time grid on the way in
         (`_raw_cube_on_grid`) — the raw and processed cubes have different frame counts.
+    raw_dopplergram : bool
+        The same for the Doppler cube: read ``data/raw/<region>_dopplergram_cube.fits``
+        instead of 02A's ``_dopplergram_calibrated_cube.fits``. This is the velocity as
+        HMI measured it, so **none** of `src/doppler_calibration.py` has been applied —
+        the spacecraft term ``v_SDO`` is still in it, and that one alone is a ±3 km/s
+        sinusoid at exactly 24 h, orders of magnitude above the umbral signal. Use it to
+        see what the calibration removed, never as the input to `fit_diurnal` or the FFT.
+        Also needs ``raw_dir``, and is reindexed onto the processed grid the same way.
     raw_dir : path | None
-        This region's directory under ``data/raw/``, required when ``raw_magnetogram``.
+        This region's directory under ``data/raw/``, required when ``raw_magnetogram`` or
+        ``raw_dopplergram``.
     **region_kwargs : forwarded to `build_regions` — thresholds, cluster mode, mag_filter.
 
     Returns
@@ -744,21 +754,29 @@ def load_noaa_region(
     processed_dir = pathlib.Path(processed_dir)
 
     cube_cont, timestamps = read_cube(processed_dir / f'{region}_continuum_cube.fits')
+
+    if (raw_magnetogram or raw_dopplergram) and raw_dir is None:
+        which = ' and '.join(n for n, on in [('raw_magnetogram', raw_magnetogram),
+                                             ('raw_dopplergram', raw_dopplergram)] if on)
+        raise ValueError(
+            f"{which}=True needs raw_dir — this region's directory under data/raw/, e.g. "
+            "pathlib.Path(str(processed_dir).replace('/processed/', '/raw/'))")
+
+    def _read_raw(kind: str) -> np.ndarray:
+        # 01A's cubes are on the timestamps that downloaded, not on 02A's uniform grid.
+        path = pathlib.Path(raw_dir) / f'{region}_{kind}_cube.fits'
+        cube, times = read_cube(path)
+        return _raw_cube_on_grid(cube, times, timestamps, cube_cont.shape[1:], path.name)
+
     if raw_magnetogram:
-        if raw_dir is None:
-            raise ValueError(
-                "raw_magnetogram=True needs raw_dir — this region's directory under "
-                "data/raw/, e.g. "
-                "pathlib.Path(str(processed_dir).replace('/processed/', '/raw/'))")
-        raw_dir = pathlib.Path(raw_dir)
-        mag_path = raw_dir / f'{region}_magnetogram_cube.fits'
-        cube_mag, mag_times = read_cube(mag_path)
-        # 01A's cube is on the timestamps that downloaded, not on 02A's uniform grid.
-        cube_mag = _raw_cube_on_grid(cube_mag, mag_times, timestamps,
-                                     cube_cont.shape[1:], mag_path.name)
+        cube_mag = _read_raw('magnetogram')
     else:
         cube_mag, _ = read_cube(processed_dir / f'{region}_magnetogram_corrected_cube.fits')
-    cube_dop, _ = read_cube(processed_dir / f'{region}_dopplergram_calibrated_cube.fits')
+
+    if raw_dopplergram:
+        cube_dop = _read_raw('dopplergram')
+    else:
+        cube_dop, _ = read_cube(processed_dir / f'{region}_dopplergram_calibrated_cube.fits')
 
     n_t = len(timestamps)
     present = {name: np.isfinite(cube).any(axis=(1, 2))
