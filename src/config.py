@@ -212,6 +212,14 @@ def _valid_region_11536() -> np.ndarray:
 
     Tied to that region's 139x484 box, which is why it is a per-region override and not
     a general option.
+
+    This mask is not cosmetic. 03A used to apply it in 11536's own block but *not* in the
+    cross-region loop that fed 04, so the two disagreed about which spot they were
+    measuring: the loop tracked a 235 px umbra and fitted a 24 h amplitude of
+    165.0 +/- 2.1 m/s, while the block tracked the intended 130 px umbra and got
+    214.2 +/- 2.6 m/s. The published Wilson-depression point for 11536 was the former.
+    Keeping the mask here, where `params_for` serves every notebook from one place, is
+    what stops the two from drifting apart again.
     """
     valid = np.ones((139, 484), dtype=bool)
     valid[:, 0:242] = False
