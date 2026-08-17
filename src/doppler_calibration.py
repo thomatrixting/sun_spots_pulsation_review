@@ -389,7 +389,7 @@ def download_disk_center(base_dir, time_start, time_end, notify_email,
 
     from sunpy.coordinates import frames
 
-    from src.scripts import download_regions
+    from src.download import download_regions
 
     base_dir = pathlib.Path(base_dir)
     # a.jsoc.Cutout ignores the observer and assumes SDO, but the frame still needs an
@@ -493,29 +493,11 @@ def calibrate_cube(region_dir, sdo_method: str = 'keywords', v_sdo_by_time=None,
     """
     import pathlib
 
-    import sunpy.map
-
-    from src.utilities import _fit_to_shape, parse_frame_timestamp, read_cube
+    from src.utilities import apply_per_frame_correction
 
     region_dir = pathlib.Path(region_dir)
-    cube, timestamps = read_cube(region_dir / f'{region}_dopplergram_cube.fits')
 
-    frame_files = {parse_frame_timestamp(p): p
-                   for p in (region_dir / region).glob(series_glob)}
-    frame_files.pop(None, None)
-
-    missing = [t for t in timestamps if t not in frame_files]
-    if missing:
-        raise ValueError(
-            f'{len(missing)} cube frame(s) have no matching file in {region_dir / region} '
-            f'(first: {missing[0]}) — the per-frame headers are needed for the geometry. '
-            f'Was the frame directory cleaned after the cube was built?')
-
-    out = np.empty_like(cube, dtype=np.float32)
-    term_means = {name: np.full(len(timestamps), np.nan) for name in include}
-
-    for i, timestamp in enumerate(timestamps):
-        smap = sunpy.map.Map(str(frame_files[timestamp]))
+    def correct(smap, timestamp):
         v_sdo = None
         if v_sdo_by_time is not None:
             entry = v_sdo_by_time[timestamp]
@@ -525,11 +507,13 @@ def calibrate_cube(region_dir, sdo_method: str = 'keywords', v_sdo_by_time=None,
             smap, sdo_method=sdo_method, v_sdo=v_sdo, include=include,
             include_meridional=include_meridional)
 
-        values = corrected.to_value(u.m / u.s)
-        # A frame that make_cube had to pad or crop is a different shape from the cube;
-        # match its handling so the two stay aligned.
-        out[i] = values if values.shape == cube.shape[1:] else _fit_to_shape(values, cube.shape[1:])
-        for name, term in terms.items():
-            term_means[name][i] = np.nanmean(term.to_value(u.m / u.s))
+        return (corrected.to_value(u.m / u.s),
+                {name: np.nanmean(term.to_value(u.m / u.s)) for name, term in terms.items()})
 
-    return out, timestamps, term_means
+    return apply_per_frame_correction(
+        region_dir / f'{region}_dopplergram_cube.fits',
+        region_dir / region,
+        correct,
+        series_glob=series_glob,
+        diag_names=include,
+    )

@@ -234,36 +234,20 @@ def limb_darkening_cube(region_dir, region: str = 'region_01', method: str = 'ge
     """
     import pathlib
 
-    import sunpy.map
-
-    from src.utilities import _fit_to_shape, parse_frame_timestamp, read_cube
+    from src.utilities import apply_per_frame_correction
 
     region_dir = pathlib.Path(region_dir)
-    cube, timestamps = read_cube(region_dir / f'{region}_continuum_cube.fits')
 
-    frame_files = {parse_frame_timestamp(p): p
-                   for p in (region_dir / region).glob(series_glob)}
-    frame_files.pop(None, None)
-
-    missing = [t for t in timestamps if t not in frame_files]
-    if missing:
-        raise ValueError(
-            f'{len(missing)} cube frame(s) have no matching file in {region_dir / region} '
-            f'(first: {missing[0]}) — the per-frame headers are needed for the geometry. '
-            f'Was the frame directory cleaned after the cube was built?')
-
-    out = np.empty_like(cube, dtype=np.float32)
-    c_means = np.full(len(timestamps), np.nan)
-
-    for i, timestamp in enumerate(timestamps):
-        smap = sunpy.map.Map(str(frame_files[timestamp]))
+    def correct(smap, _timestamp):
         corrected, c, _ = correct_limb_darkening(
             smap, method=method, u_lambda=u_lambda, v_lambda=v_lambda)
+        return corrected, {'c': np.nanmean(c)}
 
-        # A frame make_cube had to pad or crop is a different shape from the cube; match
-        # its handling so the two stay aligned.
-        out[i] = (corrected if corrected.shape == cube.shape[1:]
-                  else _fit_to_shape(corrected, cube.shape[1:]))
-        c_means[i] = np.nanmean(c)
-
-    return out, timestamps, c_means
+    cube, timestamps, diag = apply_per_frame_correction(
+        region_dir / f'{region}_continuum_cube.fits',
+        region_dir / region,
+        correct,
+        series_glob=series_glob,
+        diag_names=('c',),
+    )
+    return cube, timestamps, diag['c']

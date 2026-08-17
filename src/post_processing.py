@@ -1,21 +1,23 @@
-"""
-HMI dopplergram/magnetogram calibration coefficients (``hmi.coefficients``).
+"""Inverting HMI's polynomial calibration, to rebuild a dopplergram from a raw cube.
 
-JSOC corrects the raw line-of-sight velocities V_lcp/V_rcp with a per-time
-cubic polynomial::
+Named `post_processing` because it undoes work JSOC already did: `hmi.coefficients` holds
+the cubic that maps the instrument's measured quantity onto the published one, and
+`invert_cubic` runs it backwards so the pre-calibration values can be recovered and a
+different correction applied instead.
 
-    y = c0 + c1*x + c2*x**2 + c3*x**3
+**Parked, not retired.** Nothing in the A or B line calls this. It is exercised only by
+`01T_coefficient_reconstruction.ipynb` on the T line, kept because the option is wanted in
+the pipeline eventually.
 
-whose COEFF0..3 coefficients are published in the ``hmi.coefficients`` DRMS
-series, one row per ~12h validity window (keyed by T_REC, valid over
-[T_START, T_STOP)).  This module fetches those coefficients, matches them to
-per-frame observation times, and applies/inverts the cubic vectorized over an
-entire (n_t, ny, nx) cube (no sympy, no per-pixel Python loop).
+**The open caveat.** Reconstructing DS01's dopplergram this way does *not* reproduce the
+shipped `cube_dopplergram_corrected.fits` — the correlation between the two is about zero.
+The most likely reading is that the shipped file corrects something else (an orbital or
+gravitational-redshift term) rather than the tuning nonlinearity this cubic describes. Until
+that is settled, treat a reconstructed cube as an experiment, not as data.
 
-It also implements the linear V_lcp/V_rcp <-> V, B relation:
+Formulae, per frame:
 
-    V = (V_lcp + V_rcp) / 2
-    B = (V_lcp - V_rcp) * K
+    V = (V_lcp + V_rcp) / 2          B = (V_lcp - V_rcp) . K
 """
 
 from __future__ import annotations
@@ -181,3 +183,48 @@ def v_b_from_vlcp_rcp(V_lcp: np.ndarray, V_rcp: np.ndarray, k: float = K) -> tup
     V = (V_lcp + V_rcp) / 2.0
     B = (V_lcp - V_rcp) * k
     return V, B
+
+
+def reconstruct_cubes(cube_dop, cube_mag, obs_times, k=K, pad_hours=24.0, verbose=True):
+    """Rebuild dopplergram and magnetogram cubes with HMI's cubic calibration inverted.
+
+    Generalised from the loop that used to sit in `01B`: fetch the coefficients covering
+    the observation window, match each frame to the 12 h window it falls in, split V and B
+    into the two circular polarisations, invert the cubic on each, and recombine.
+
+    Returns `(cube_dop_reconstructed, cube_mag_reconstructed)`.
+    """
+    from astropy.time import Time
+
+    times = Time(obs_times)
+    coefficients = fetch_coefficients(times.min(), times.max(), pad_hours=pad_hours)
+    matched = match_coefficients_to_times(times, coefficients)
+    c0, c1, c2, c3 = (_broadcast(matched[f'COEFF{i}'].to_numpy()) for i in range(4))
+
+    v_lcp, v_rcp = vlcp_rcp_from_v_b(cube_dop, cube_mag, k=k)
+    v_lcp_raw = invert_cubic(v_lcp, c0, c1, c2, c3)
+    v_rcp_raw = invert_cubic(v_rcp, c0, c1, c2, c3)
+    dop, mag = v_b_from_vlcp_rcp(v_lcp_raw, v_rcp_raw, k=k)
+
+    if verbose:
+        print(f'{len(matched)} frame(s) matched to {coefficients["T_REC"].nunique()} '
+              f'coefficient window(s)')
+    return dop, mag
+
+
+def write_reconstructed_cube(cube, template_path, out_path, overwrite=False):
+    """Write a reconstructed cube, reusing a template cube's header for its WCS."""
+    import pathlib
+
+    from astropy.io import fits
+
+    out_path = pathlib.Path(out_path)
+    if out_path.exists() and not overwrite:
+        print(f'Skipping (already exists): {out_path}')
+        return out_path
+    with fits.open(template_path) as hdul:
+        header = hdul[0].header.copy()
+    fits.PrimaryHDU(np.asarray(cube, dtype=np.float32), header=header).writeto(
+        out_path, overwrite=overwrite, output_verify='silentfix')
+    print(f'Saved -> {out_path}')
+    return out_path

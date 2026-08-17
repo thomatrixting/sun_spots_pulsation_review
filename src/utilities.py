@@ -1,16 +1,24 @@
-# Source - https://stackoverflow.com/a/54529216
-# Posted by Mc Missile, modified by community. See post 'Timeline' for change history
-# Retrieved 2026-05-17, License - CC BY-SA 4.0
+"""Shared plumbing: reading and writing cubes, and putting frames on a common clock.
+
+Used by every stage. Anything that talks to the network lives in `download`; anything
+that draws lives in `plotting`.
+
+The time-grid functions are the heart of it. The three HMI series for one region do not
+arrive on the same timestamps — frames go missing, and NOAA 11117 runs its continuum and
+magnetogram 360 s out of phase for a whole day. Intersecting the timestamps was the
+original approach and it was wrong: dropping a frame leaves an uneven cadence, which
+breaks every downstream Fourier transform silently. Instead `regular_time_grid` lays one
+uniform clock over the union of the series and `reindex_on_grid` drops each frame into
+its slot, leaving NaN where an observation genuinely does not exist.
+"""
 
 import os
 import pathlib
 import re
+import warnings
 from datetime import datetime
 
 import numpy as np
-import pandas as pd
-import astropy.units as u
-from astropy.coordinates import SkyCoord
 from astropy.io import fits
 
 _FRAME_TS_RE = re.compile(r'\.(\d{8})_(\d{6})_TAI\.')
@@ -25,116 +33,6 @@ def parse_frame_timestamp(filename):
     if not m:
         return None
     return datetime.strptime(m.group(1) + m.group(2), '%Y%m%d%H%M%S')
-
-
-def locate_ar_window(noaa_number, date, n_days=4, padding=30 * u.arcsec,
-                     min_half_extent=60 * u.arcsec, max_half_extent=250 * u.arcsec,
-                     prefer_frm='NOAA SWPC Observer', statistic='median'):
-    """
-    Query the HEK for NOAA `noaa_number` over an n_days window anchored at `date`, and
-    return a square cutout box sized to the sunspot group's typical reported extent across
-    that window but positioned at `date`'s own reported center — for use with
-    a.jsoc.Cutout(tracking=True).
-
-    Position is left entirely to JSOC's rotation tracking; only the box's *size* accounts
-    for the AR growing/shrinking across the window (real apparent position sweeps hundreds
-    of arcsec/day from solar rotation alone, so combining raw day-to-day positions would be
-    wrong — only the reported half-extent per row is meaningful to combine).
-
-    Sizing notes, all learned the hard way from the records HEK actually returns:
-
-    - **Provider matters more than statistics.** A single NOAA number returns rows from
-      several `frm_name` providers describing different things. 'NOAA SWPC Observer' is the
-      *sunspot group* (half-width ~70-140 arcsec); 'HMI SHARP' is the whole magnetic active
-      region complex including plage (half-width ~250-400 arcsec). Mixing them and taking a
-      max — or even a median — sizes the box off whichever provider happens to dominate,
-      which is how NOAA 11363 ended up with a 736 arcsec box around a ~110 arcsec spot.
-      Rows are therefore filtered to `prefer_frm` first, falling back to all rows (with a
-      warning) when that provider is absent for the window.
-    - **The box is square.** SWPC reports an essentially degenerate latitude extent
-      (half-height 3-9 arcsec), so its height carries no information; the half-width is the
-      only usable scale. A square box also keeps ARs comparable and gives the quiet-sun
-      plane fit an isotropic footprint.
-    - **Median, then clamp** to [min_half_extent, max_half_extent]. The bounding boxes are
-      coarse and a single bad row should not set the size for the whole window.
-
-    Oversizing is not harmless: a large box spans a large line-of-sight solar-rotation
-    velocity gradient, which contaminates any quiet-sun reference computed over it.
-
-    Undersizing is worse, though, because it silently truncates the thing being measured.
-    SWPC's reported extent is not always generous: NOAA 11536's group actually grows to
-    ~220 arcsec across and sits ~35 arcsec off the reported centroid, so median sizing
-    clips it on every frame. Use `statistic='max'` (and more `padding`) for such regions —
-    always after checking the resulting box against the frames, not on faith.
-
-    Extents are measured from each row's own `hpc_x`/`hpc_y` centroid rather than from raw
-    `hpc_bbox` min/max, because the reported bbox is not guaranteed to be centered on the
-    reported centroid — and the centroid is what the box gets positioned on.
-
-    Parameters:
-    - noaa_number: NOAA AR catalog number
-    - date: anchor day, 'YYYY-MM-DD' (box position and reference frame come from this day)
-    - n_days: number of days the window should span (window is date 00:00 through
-      date + n_days - 1 23:59:59)
-    - padding: margin added to the box on each side
-    - min_half_extent: floor on the box half-size, so a degenerate bbox can't collapse it
-    - max_half_extent: ceiling on the box half-size, before padding
-    - prefer_frm: HEK `frm_name` to size and position from; None uses every row
-    - statistic: 'median' (default, robust to one bad row) or 'max' (largest reported
-      extent in the window) — how the per-row half-widths are combined
-
-    Returns:
-    - (bottom_left, top_right, time_start, time_end): SkyCoord corners (in the anchor
-      day's frame) and ISO time strings spanning the full n_days window.
-    """
-    from sunpy.net import Fido, attrs as a
-
-    time_start = f'{date} 00:00:00'
-    end_date = (pd.Timestamp(date) + pd.Timedelta(days=n_days - 1)).date()
-    time_end = f'{end_date} 23:59:59'
-
-    result = Fido.search(a.Time(time_start, time_end),
-                          a.hek.EventType('AR'), a.hek.AR.NOAANum == noaa_number)
-    rows = result['hek']
-    if len(rows) == 0:
-        raise ValueError(f"No HEK record found for NOAA {noaa_number} in {time_start}..{time_end}")
-
-    if prefer_frm is not None:
-        preferred = [row for row in rows if row['frm_name'] == prefer_frm]
-        if preferred:
-            rows = preferred
-        else:
-            print(f"WARNING: no '{prefer_frm}' HEK rows for NOAA {noaa_number} in the window; "
-                  f"sizing from all {len(rows)} row(s) — check the resulting box.")
-
-    anchor_date = pd.Timestamp(date).date()
-    anchor_idx = next(
-        (i for i, row in enumerate(rows)
-         if pd.Timestamp(row['event_starttime'].iso).date() == anchor_date),
-        None,
-    )
-    if anchor_idx is None:
-        anchor_idx = 0
-        print(f"WARNING: no HEK row exactly on {date} for NOAA {noaa_number}; "
-              f"using earliest row in window as anchor ({rows[0]['event_starttime']}).")
-    anchor_row = rows[anchor_idx]
-
-    # Half-extents measured from each row's own centroid, so size and position agree.
-    half_widths = [np.abs(row['hpc_bbox'].Tx.to_value(u.arcsec) - row['hpc_x']).max()
-                   for row in rows]
-    combine = {'median': np.median, 'max': np.max}.get(statistic)
-    if combine is None:
-        raise ValueError(f"statistic must be 'median' or 'max', got {statistic!r}")
-    raw_half_w = combine(half_widths)
-    half = min(max(raw_half_w * u.arcsec, min_half_extent), max_half_extent) + padding
-
-    frame = anchor_row['hpc_bbox'].frame[0]
-    cx, cy = anchor_row['hpc_x'] * u.arcsec, anchor_row['hpc_y'] * u.arcsec
-    bottom_left = SkyCoord(cx - half, cy - half, frame=frame)
-    top_right   = SkyCoord(cx + half, cy + half, frame=frame)
-    print(f"NOAA {noaa_number}: box {2 * half:.0f} square, centered {cx:.0f},{cy:.0f} — from "
-          f"{len(rows)} {prefer_frm or 'HEK'} row(s), {statistic} half-width {raw_half_w:.0f} arcsec")
-    return bottom_left, top_right, time_start, time_end
 
 
 def _fit_to_shape(data, target_shape):
@@ -240,6 +138,68 @@ def make_cube(pattern, output_path, overwrite=False):
 
     return write_cube(cube, output_path, header=header, timestamps=timestamps,
                       overwrite=overwrite)
+
+
+def apply_per_frame_correction(cube_path, frame_dir, correct, series_glob,
+                               diag_names=()):
+    """Apply a per-frame correction to a cube, matching frames to their originals by time.
+
+    Both physical corrections need each frame's *own* header: the OBS_V* keywords change
+    every frame, and mu at the box centre runs 0.78 -> 0.87 -> 0.85 across NOAA 11536's
+    72 h window, so one correction map applied cube-wide would leave most of the effect in
+    place and inject a spurious trend of its own. `make_cube` keeps only the reference
+    frame's header, so the geometry has to be read back from the surviving per-file frames
+    and matched to the cube **by timestamp** — never by position, so that a frame missing
+    from the middle of the window cannot silently shift every later correction out of step.
+
+    `doppler_calibration.calibrate_cube` and `limb_darkening.limb_darkening_cube` are both
+    this function plus a `correct`; they used to be two copies of the same 70 lines.
+
+    Parameters
+    ----------
+    cube_path : path to the cube to correct (read with `read_cube`)
+    frame_dir : directory holding the per-frame FITS the cube was built from
+    correct   : callable (sunpy_map, timestamp) -> (values_2d, {diag_name: scalar})
+    series_glob : filename pattern for the per-frame files. Patterns here deliberately
+        match every cadence, since NOAA 11117 has to come from the 45 s series — a
+        720 s-only pattern silently finds nothing and reports every frame as missing.
+    diag_names : names of the per-frame diagnostics `correct` returns
+
+    Returns
+    -------
+    (cube, timestamps, diag_means) with `cube` float32 and the same shape as the input,
+    and `diag_means` mapping each name to an (n_t,) array.
+    """
+    import sunpy.map
+
+    frame_dir = pathlib.Path(frame_dir)
+    cube, timestamps = read_cube(cube_path)
+
+    frame_files = {parse_frame_timestamp(p): p for p in frame_dir.glob(series_glob)}
+    frame_files.pop(None, None)
+
+    missing = [t for t in timestamps if t not in frame_files]
+    if missing:
+        raise ValueError(
+            f'{len(missing)} cube frame(s) have no matching file in {frame_dir} '
+            f'(first: {missing[0]}) — the per-frame headers are needed for the geometry. '
+            f'Was the frame directory cleaned after the cube was built?')
+
+    out = np.empty_like(cube, dtype=np.float32)
+    diag_means = {name: np.full(len(timestamps), np.nan) for name in diag_names}
+
+    for i, timestamp in enumerate(timestamps):
+        smap = sunpy.map.Map(str(frame_files[timestamp]))
+        values, diagnostics = correct(smap, timestamp)
+
+        # A frame make_cube had to pad or crop is a different shape from the cube; match
+        # its handling so the two stay aligned.
+        out[i] = (values if values.shape == cube.shape[1:]
+                  else _fit_to_shape(values, cube.shape[1:]))
+        for name, value in diagnostics.items():
+            diag_means[name][i] = value
+
+    return out, timestamps, diag_means
 
 
 def write_cube(cube, output_path, header=None, timestamps=None, history=None,
@@ -576,68 +536,30 @@ def reindex_series_on_grid(values, times, grid, cadence_s, tolerance_s=None):
     return out
 
 
-def ds9_box_to_hpc(x_c_ds9, y_c_ds9, w_px, h_px, hmi_map):
+def normalize(values):
+    """Min-max scale to [0, 1], ignoring NaNs. All-NaN or flat input returns NaNs/zeros.
+
+    For comparing the *shape* of two series with different units or offsets — a
+    magnetogram trend against a Doppler one, say. It destroys amplitude information, so
+    it is for looking, never for measuring.
     """
-    Convert a DS9 box region (1-indexed pixels) to Helioprojective corner coordinates.
+    values = np.asarray(values, dtype=float)
+    lo, hi = np.nanmin(values), np.nanmax(values)
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return np.full_like(values, np.nan)
+    if hi == lo:
+        return np.zeros_like(values)
+    return (values - lo) / (hi - lo)
 
-    Parameters:
-    - x_c_ds9, y_c_ds9: DS9 pixel center (1-indexed)
-    - w_px, h_px: box width and height in pixels
-    - hmi_map: sunpy.map.Map with HMI WCS
 
-    Returns:
-    - (bottom_left, top_right): SkyCoord pair for a.jsoc.Cutout (SW and NE corners in HPC)
+def mean_series(cube, mask):
+    """Spatial mean of `cube` over `mask`, per frame. NaN where the mask is empty.
+
+    The RuntimeWarning for an all-NaN slice is suppressed on purpose: a gap frame, or a
+    frame where the spot was not detected, legitimately has nothing to average, and NaN
+    is the correct answer rather than something to be warned about once per frame.
     """
-    # CROTA2≈180°: Tx ∝ −pixel_x, Ty ∝ −pixel_y
-    # SW corner (min Tx, min Ty) = max pixel_x, max pixel_y; DS9 is 1-indexed → subtract 1
-    x_bl = x_c_ds9 + w_px / 2 - 1
-    y_bl = y_c_ds9 + h_px / 2 - 1
-    x_tr = x_c_ds9 - w_px / 2 - 1
-    y_tr = y_c_ds9 - h_px / 2 - 1
-    return hmi_map.wcs.pixel_to_world(x_bl, y_bl), hmi_map.wcs.pixel_to_world(x_tr, y_tr)
-
-
-def plot_regions_on_map(hmi_map_rot, regions, cmap=None, norm=None):
-    """
-    Draw a list of HPC box regions as labelled quadrangles on a rotated HMI map.
-
-    Works for both continuum and magnetogram maps:
-    - Continuum (BUNIT != Gauss): gray colormap with percentile clipping
-    - Magnetogram (BUNIT == Gauss): RdBu_r colormap with ±500 G symmetric norm
-
-    Parameters:
-    - hmi_map_rot: North-up sunpy.map.Map (already rotated)
-    - regions: list of (bottom_left, top_right) SkyCoord pairs
-    - cmap: override colormap (auto-detected if None)
-    - norm: override matplotlib norm (auto-detected if None)
-    """
-    import matplotlib.pyplot as plt
-    import astropy.units as u
-
-    is_magnetogram = 'gauss' in hmi_map_rot.meta.get('bunit', '').lower()
-
-    if cmap is None:
-        cmap = 'RdBu_r' if is_magnetogram else 'gray'
-    if norm is None and is_magnetogram:
-        norm = plt.Normalize(vmin=-500, vmax=500)
-
-    title = 'HMI Magnetogram — todas las regiones' if is_magnetogram else 'HMI Continuo — todas las regiones'
-
-    colors = ['red', 'cyan', 'yellow', 'lime', 'magenta', 'orange', 'deepskyblue', 'white']
-    fig = plt.figure(figsize=(10, 10))
-    ax = fig.add_subplot(111, projection=hmi_map_rot)
-
-    if norm is not None:
-        hmi_map_rot.plot(axes=ax, cmap=cmap, norm=norm)
-    else:
-        hmi_map_rot.plot(axes=ax, cmap=cmap, clip_interval=(1, 99.9) * u.percent)
-
-    hmi_map_rot.draw_grid(axes=ax, color='white', alpha=0.3, lw=0.5)
-    for i, (bl, tr) in enumerate(regions):
-        hmi_map_rot.draw_quadrangle(bl, top_right=tr,
-                                    edgecolor=colors[i % len(colors)],
-                                    linewidth=2, label=f'Region {i + 1}')
-    ax.legend(loc='upper right', fontsize=8)
-    ax.set_title(title)
-    plt.tight_layout()
-    plt.show()
+    import numpy as _np
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        return _np.nanmean(_np.where(mask, cube, _np.nan), axis=(1, 2))

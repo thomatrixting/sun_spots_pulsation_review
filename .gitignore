@@ -1,10 +1,16 @@
+# Datos y salidas — pesados, se regeneran con las notebooks
 data/
-.claude
-*test*
+database
 *.fits
 *.fit
 *.p
+
+# Notas personales
 notes.md
+
+# Herramientas locales
+.claude
+.vscode/
 
 # Archivos de Jupyter y Python
 .ipynb_checkpoints/
@@ -14,7 +20,3 @@ __pycache__/
 # Entornos virtuales si decides usar uno local
 venv/
 .venv/
-EOF
-.vscode/
-
-database
