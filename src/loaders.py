@@ -35,9 +35,18 @@ from .segmentation import build_regions, masks_from_cubes
 from .utilities import mean_series as _mean_series, read_cube, reindex_on_grid
 
 def _load_cube(path: pathlib.Path, fill: float) -> np.ndarray:
+    """Read a DS0N cube, turning its fill value into NaN.
+
+    Kept in float32, which is what is actually on disk (BITPIX -32) and what HMI's
+    precision justifies. The previous `astype(float)` upcast to float64 and so doubled
+    the memory for no extra information: DS00 is 901x299x794, i.e. 1.7 GB per cube in
+    float64 against 0.86 GB in float32, and this loader reads four of them. Every mean
+    over these cubes is still accumulated in float64 — see `utilities.mean_series` — so
+    the numbers are unchanged.
+    """
     with fits.open(path) as hdul:
-        arr = hdul[0].data.astype(float)  # type: ignore[union-attr]
-    return np.where(np.abs(arr) > fill, np.nan, arr)
+        arr = hdul[0].data.astype(np.float32)  # type: ignore[union-attr]
+    return np.where(np.abs(arr) > fill, np.float32(np.nan), arr)
 
 
 def verify_cadence(

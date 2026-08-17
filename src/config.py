@@ -228,15 +228,7 @@ def _valid_region_11536() -> np.ndarray:
 # slot from the nearest magnetogram frame; 0 leaves the NaNs, which is the honest default —
 # filling fabricates a coincidence the observations do not have.
 REGION_PARAMS: dict[int | str, dict] = {
-    11106: dict(
-        # The only region loaded from the raw cubes as well, to see what the 02A
-        # corrections actually removed. The raw dopplergram keeps the whole calibration
-        # unapplied (v_SDO, ~3 km/s at 24 h), so it is for comparison, never for measuring
-        # the umbral oscillation.
-        raw_magnetogram=True,
-        raw_dopplergram=True,
-        frame_idx=None,
-    ),
+    11106: dict(frame_idx=None),
     11117: dict(
         frame_idx=400,
         # From 2010-10-30 the continuum runs at 720 s on even slots and the magnetogram at
@@ -252,6 +244,19 @@ REGION_PARAMS: dict[int | str, dict] = {
 
 # Per-DS deviations for line B. Empty so far — every DS0N dataset uses the same cuts.
 DS0N_PARAMS: dict[str, dict] = {}
+
+# Loading a region from its *raw* cubes instead of 02A's corrected ones, to see what the
+# corrections removed. This is a comparison view, never an analysis configuration:
+#
+#   - the raw dopplergram has the whole calibration unapplied. v_SDO alone is ~3 km/s and
+#     *diurnal*, i.e. sitting exactly on the period this project measures, so an amplitude
+#     read off a raw cube is measuring the spacecraft, not the sunspot.
+#   - the raw magnetogram still carries the quiet-sun plane.
+#
+# It used to live in 03A as two flags in NOAA 11106's block. Keeping it out of REGION_PARAMS
+# is deliberate: parameters there flow into `04` as well, and 11106's fitted amplitude would
+# silently have become an uncalibrated number.
+RAW_COMPARE = dict(raw_magnetogram=True, raw_dopplergram=True)
 
 # Keys that steer the notebook rather than the loader, and so must not be forwarded to
 # `load_noaa_region` / `load_ds0n_region`.

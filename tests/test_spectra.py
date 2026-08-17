@@ -204,11 +204,22 @@ def test_detrend_removes_a_line_but_not_the_oscillation():
 
 
 def test_moving_average_smooths_out_the_period():
+    """A full-period window averages the tone away wherever the window is complete.
+
+    Only the interior is checked. `min_periods` lets the edges return a mean over a
+    *partial* window, which is deliberate — it keeps a gappy series from going all-NaN —
+    but a partial window covers a fraction of a period and so does not cancel it. Edge
+    values of a rolling mean are not to be read as signal.
+    """
     _, values = _series()
     smoothed, window = moving_average(values, CADENCE_S, PERIOD_H * 60)
-    inner = smoothed[np.isfinite(smoothed)]
-    assert np.nanmax(np.abs(inner)) < 0.1 * AMPLITUDE, 'a full-period window left the tone'
-    return f'window {window} frames, residual {np.nanmax(np.abs(inner)):.3f} m/s'
+    half = window // 2
+    interior = smoothed[half:-half]
+    assert np.isfinite(interior).all(), 'the interior should be fully defined'
+    assert np.nanmax(np.abs(interior)) < 0.1 * AMPLITUDE, 'a full-period window left the tone'
+    edge = np.nanmax(np.abs(smoothed[:half]))
+    return (f'window {window} frames; interior residual '
+            f'{np.nanmax(np.abs(interior)):.3f} m/s, partial-window edge {edge:.1f} m/s')
 
 
 def test_spectral_peaks_finds_the_tone():

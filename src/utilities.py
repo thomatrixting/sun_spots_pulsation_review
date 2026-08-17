@@ -562,4 +562,7 @@ def mean_series(cube, mask):
     import numpy as _np
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
-        return _np.nanmean(_np.where(mask, cube, _np.nan), axis=(1, 2))
+        # dtype=float64 so a float32 cube still sums in double precision: the stored
+        # values are exactly representable either way, so this makes the result
+        # independent of how the cube happens to be held in memory.
+        return _np.nanmean(_np.where(mask, cube, _np.nan), axis=(1, 2), dtype=_np.float64)

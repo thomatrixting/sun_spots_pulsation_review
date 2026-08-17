@@ -286,11 +286,11 @@ def compute_metrics(data: dict) -> dict:
         mean_mag_umb   = _mean_series(cube_mag, umbra),
         mean_mag_pen   = _mean_series(cube_mag, penumbra),
         mean_mag_both  = _mean_series(cube_mag, both),
-        mean_mag_quiet = np.array([np.nanmean(cube_mag_qsun[t]) for t in range(n_qsun)]),
+        mean_mag_quiet = np.array([np.nanmean(cube_mag_qsun[t], dtype=np.float64) for t in range(n_qsun)]),
         mean_dop_umb   = _mean_series(cube_dop, umbra),
         mean_dop_pen   = _mean_series(cube_dop, penumbra),
         mean_dop_both  = _mean_series(cube_dop, both),
-        mean_dop_quiet = np.array([np.nanmean(cube_dop_qsun[t]) for t in range(n_qsun)]),
+        mean_dop_quiet = np.array([np.nanmean(cube_dop_qsun[t], dtype=np.float64) for t in range(n_qsun)]),
         area_umb       = umbra.sum(axis=(1, 2)).astype(float),
         area_pen       = penumbra.sum(axis=(1, 2)).astype(float),
         area_both      = both.sum(axis=(1, 2)).astype(float),
@@ -657,3 +657,105 @@ def plot_mu_vs_trend(data, metrics, mu_means, key='mean_mag', degree=2,
     save_figure(fig, plots_dir, f'mu_vs_{key}_trend.png', save)
     plt.show()
     plt.close(fig)
+
+
+# ── region report ────────────────────────────────────────────────────────────
+
+def describe_region(data, verbose=True):
+    """Print what a loaded region actually contains, and return the same as a dict.
+
+    This was ~60 lines repeated at the top of every per-region block in 03A and 03T. It is
+    the same for both lines because both loaders return the same `data` dict.
+
+    The things worth reading every time:
+
+    - **gaps** — NaN slots where a series has no frame. Not measurements; anything derived
+      from them is NaN by design.
+    - **cont & mag together** — every magnetogram quantity is averaged over a mask built
+      from the *continuum*, so it needs both series in the same slot. Where they never
+      coincide, every mean B is NaN and the B panels break off even though both cubes have
+      data. `mag_fill_slots` in `config.REGION_PARAMS` is the repair.
+    - **cluster switches** — if the tracker lost the spot and re-picked, every series has a
+      step at that frame and nothing else would show it. Not automatically a bug: a decaying
+      spot legitimately vanishes out from under the tracker near the end of a long window,
+      so check *when* it happened.
+    """
+    report = {}
+    n_t = data['n_t']
+    timestamps = data.get('timestamps')
+    present = data.get('present') or {}
+
+    if verbose:
+        print(f"  cube shape (n_t, ny, nx) : {data['cube_cont'].shape}")
+        print(f"  time span                : {data['time_h'][-1]:.1f} h "
+              f"({n_t} frames @ {data['cadence_s']:.0f} s)")
+        if data.get('umbra_thresh') is not None:
+            print(f"  segmentation             : umbra < {data['umbra_thresh']:,.0f}, "
+                  f"penumbra < {data['penumbra_thresh']:,.0f}")
+
+    report['gaps'] = {k: int((~v).sum()) for k, v in present.items()}
+    if verbose and present:
+        if any(report['gaps'].values()):
+            print(f"  NaN (missing) frames     : {report['gaps']}")
+            for name, flags in present.items():
+                missing = np.flatnonzero(~flags)
+                for i in missing[:5]:
+                    print(f'      {name}: frame {i} = {timestamps[i]:%Y-%m-%d %H:%M}')
+                if len(missing) > 5:
+                    print(f'      {name}: ... and {len(missing) - 5} more')
+        else:
+            print('  NaN (missing) frames     : none')
+
+    if 'cont' in present and 'mag' in present:
+        both_present = present['cont'] & present['mag']
+        n_both, n_cont = int(both_present.sum()), int(present['cont'].sum())
+        report['cont_and_mag'] = (n_both, n_cont)
+        if verbose:
+            print(f'  cont & mag together      : {n_both} of {n_cont} continuum frames')
+        if n_both < n_cont:
+            missing = np.flatnonzero(present['cont'] & ~present['mag'])
+            runs = (np.split(missing, np.flatnonzero(np.diff(missing) > 1) + 1)
+                    if len(missing) else [])
+            longest = max(runs, key=len) if runs else []
+            if verbose and len(longest) > 5:
+                print(f'  WARNING: {len(longest)} consecutive frames from '
+                      f'{timestamps[longest[0]]:%Y-%m-%d %H:%M} have a continuum but no '
+                      f'magnetogram — every mean B is NaN there and the B panels break off.')
+                print('           Set mag_fill_slots = 1 for this region in '
+                      'config.REGION_PARAMS, or re-download it on one clock.')
+
+    if data.get('mag_filled') is not None and np.any(data['mag_filled']):
+        report['mag_filled'] = int(np.sum(data['mag_filled']))
+        if verbose:
+            print(f"  magnetogram slots filled : {report['mag_filled']} "
+                  f'(copied from a neighbouring frame — see mag_fill_slots)')
+
+    info = data.get('cluster_info')
+    if info is not None:
+        with_spot = info['area'] > 0
+        switched = np.flatnonzero(info['switched'])
+        report['cluster_switches'] = len(switched)
+        if verbose:
+            print(f"  cluster                  : mode={data.get('cluster_mode')}  "
+                  f"{info['n_clusters'][with_spot].min()}-{info['n_clusters'][with_spot].max()} "
+                  f"components/frame, keeping "
+                  f"{100 * np.nanmean(info['fraction']):.0f}% of the dark pixels")
+            if len(switched):
+                print(f'  WARNING: tracker re-picked the spot in {len(switched)} frame(s), '
+                      f'first at {timestamps[switched[0]]:%Y-%m-%d %H:%M} '
+                      f'(frame {switched[0]})')
+
+    with_data = present.get('cont', np.ones(n_t, dtype=bool))
+    raw = data.get('raw_area_px') or {}
+    report['areas'] = {}
+    for name, key in [('umbra', 'umbra'), ('penumbra', 'penumbra'), ('hot_spot', None)]:
+        if data.get(name) is None:
+            continue
+        area = data[name].sum(axis=(1, 2))[with_data]
+        report['areas'][name] = (float(area.mean()), int(area.min()), int(area.max()))
+        if verbose:
+            before = (f'  (raw {raw[key][with_data].mean():.0f})'
+                      if key and key in raw else '')
+            print(f'  {name:9s} area px        : mean={area.mean():.0f}  '
+                  f'min={area.min()}  max={area.max()}{before}')
+    return report

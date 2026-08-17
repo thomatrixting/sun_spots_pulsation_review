@@ -112,8 +112,11 @@ def moving_average(series, cadence_s, window_min):
     """
     cadence_min = cadence_s / 60
     window = max(1, round(window_min / cadence_min))
+    # min_periods matters: with a 120-frame window, a series carrying scattered gaps has a
+    # NaN inside almost every window, and the default (min_periods=window) would return NaN
+    # nearly everywhere. Half a window of real data is enough for a mean.
     smoothed = pd.Series(np.asarray(series, dtype=float)).rolling(
-        window, center=True).mean().to_numpy()
+        window, center=True, min_periods=max(1, window // 2)).mean().to_numpy()
     return smoothed, window
 
 

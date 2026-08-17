@@ -143,3 +143,4 @@ def save_animation(
     size_mb = save_path.stat().st_size / 1e6
     print(f'Animation saved → {save_path}  ({len(frames_idx)} frames, {size_mb:.1f} MB'
           f'{"" if embed_frames else ", frames in a sibling directory"})')
+    return save_path

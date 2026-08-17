@@ -102,7 +102,7 @@ def match_coefficients_to_times(
 
 def _broadcast(c: np.ndarray) -> np.ndarray:
     """(n_t,) -> (n_t, 1, 1) for broadcasting against (n_t, ny, nx) cubes."""
-    return np.asarray(c, dtype=float)[:, None, None]
+    return np.asarray(c, dtype=np.float32)[:, None, None]
 
 
 def apply_cubic(x: np.ndarray, c0: np.ndarray, c1: np.ndarray, c2: np.ndarray, c3: np.ndarray) -> np.ndarray:
