@@ -286,7 +286,7 @@ def regular_time_grid(time_lists, cadence_s=None, tolerance_s=None):
     timestamps throws away good frames from the other series and, worse, leaves holes in the
     time axis: NOAA 11536's Dopplergram is missing 2012-08-01 09:48 and 2012-08-02 21:48, so
     the intersection has two 1440 s jumps in an otherwise 720 s series. Anything that assumes
-    a single cadence — every FFT in src/sunspot_analysis.py — is then quietly wrong.
+    a single cadence — every estimator in src/spectra.py — is then quietly wrong.
 
     This returns a grid that is uniform *by construction* rather than one inherited from
     whatever happened to download, so a missing frame becomes a NaN frame at the right time

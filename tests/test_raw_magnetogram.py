@@ -1,5 +1,5 @@
 """Verification for `load_noaa_region(raw_magnetogram=True)` and `raw_dopplergram=True`
-in src/sunspot_analysis.py.
+in src/loaders.py.
 
 Run directly:  python tests/test_raw_magnetogram.py
 
