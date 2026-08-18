@@ -24,10 +24,12 @@ from src.spectra import (  # noqa: E402
     band_amplitude,
     detrend_poly,
     fft_spectrum,
+    find_jumps,
     interpolate_gaps,
     moving_average,
     notch_filter,
     psd_spectrum,
+    remove_jumps,
     spectral_peaks,
 )
 
@@ -201,6 +203,102 @@ def test_detrend_removes_a_line_but_not_the_oscillation():
     assert abs(np.mean(out)) < 1e-6
     assert abs(out.std() - values.std()) / values.std() < 0.02
     return f'std kept at {out.std():.2f} vs {values.std():.2f}, mean {np.mean(out):.2e}'
+
+
+def test_remove_jumps_flattens_an_injected_step():
+    """The basic case: one branch flip, a constant offset on everything after it."""
+    time_h, values = _series()
+    stepped = values.copy()
+    stepped[240:] += 1.4e4                      # the size a wrong-branch root moves by
+    out, jumps = remove_jumps(time_h, stepped)
+    assert len(jumps) == 1, f'expected 1 jump, found {len(jumps)}'
+    assert jumps['index'].iloc[0] == 240
+    # Not machine precision: the Euler prediction is a straight line and the series
+    # curves, so ~0.02 m/s of the 1.4e4 step survives. That it is 1e-6 of the step is
+    # the claim worth making.
+    residual = np.abs(out - values).max()
+    assert residual < 0.05, f'residual {residual:.3f} m/s'
+    return (f"offset {jumps['offset'].iloc[0]:.1f} recovered the original to "
+            f'{residual:.3f} m/s, {residual / 1.4e4:.1e} of the step')
+
+
+def test_remove_jumps_keeps_the_local_slope_across_the_seam():
+    """The Euler half of the algorithm, which plain step-zeroing gets wrong.
+
+    On a pure ramp the two samples either side of the jump *should* differ by
+    `slope * dt`. Forcing the step to zero would flatten that one interval and leave a
+    kink; subtracting only the excess over the Euler prediction recovers the ramp exactly.
+    """
+    time_h = np.arange(N_FRAMES) * CADENCE_S / 3600
+    ramp = 30.0 * time_h
+    stepped = ramp.copy()
+    stepped[200:] += 5.0e3
+    out, jumps = remove_jumps(time_h, stepped)
+    naive = stepped - np.where(np.arange(N_FRAMES) >= 200, stepped[200] - stepped[199], 0.0)
+    assert np.allclose(out, ramp, atol=1e-6), f'max error {np.abs(out - ramp).max():.3e}'
+    assert np.abs(naive - ramp).max() > 1.0, 'the naive version should visibly differ here'
+    return (f'ramp recovered to {np.abs(out - ramp).max():.2e}; '
+            f'zeroing the step instead would be off by {np.abs(naive - ramp).max():.2f}')
+
+
+def test_remove_jumps_leaves_a_clean_series_alone():
+    """A series with no step must come back untouched, not merely close."""
+    time_h, values = _series(noise=3.0)
+    out, jumps = remove_jumps(time_h, values)
+    assert len(jumps) == 0, f'invented {len(jumps)} jump(s) in a clean series'
+    assert np.array_equal(out, values)
+    return 'noisy sinusoid passed through unchanged, 0 jumps found'
+
+
+def test_remove_jumps_survives_gaps():
+    """NaN slots stay NaN, and a gap neither hides a jump nor poisons the cumulative sum."""
+    time_h, values = _series()
+    stepped = values.copy()
+    stepped[300:] += 8.0e3
+    stepped[100:104] = np.nan                   # a gap well before the jump
+    out, jumps = remove_jumps(time_h, stepped)
+    assert len(jumps) == 1 and jumps['index'].iloc[0] == 300
+    assert np.isnan(out[100:104]).all(), 'gap slots must stay NaN'
+    assert np.isfinite(out[104:]).all(), 'the cumulative sum leaked NaN past the gap'
+    finite = np.isfinite(stepped)
+    residual = np.abs(out[finite] - values[finite]).max()
+    assert residual < 0.05, f'residual {residual:.3f} m/s'
+    return (f'{(~finite).sum()} gap slot(s) preserved, jump at index 300 still found, '
+            f'residual {residual:.3f} m/s')
+
+
+def test_remove_jumps_handles_several_jumps():
+    """Offsets accumulate: the last segment is shifted by the sum of every step before it."""
+    time_h, values = _series()
+    stepped = values.copy()
+    stepped[150:] += 6.0e3
+    stepped[350:] -= 9.0e3
+    out, jumps = remove_jumps(time_h, stepped)
+    assert len(jumps) == 2, f'expected 2 jumps, found {len(jumps)}'
+    assert list(jumps['index']) == [150, 350]
+    # What this case is really about is that the offsets are found independently and
+    # then accumulate, so the last segment is shifted by their sum rather than by the
+    # last one alone.
+    assert abs(jumps['offset'].iloc[0] - 6.0e3) < 1.0
+    assert abs(jumps['offset'].iloc[1] + 9.0e3) < 1.0
+    residual = np.abs(out - values).max()
+    assert residual < 0.01 * AMPLITUDE, f'residual {residual:.3f} m/s'
+    return (f"offsets {[round(v) for v in jumps['offset']]} applied cumulatively, "
+            f'residual {residual:.3f} m/s = {100 * residual / AMPLITUDE:.2f}% of amplitude')
+
+
+def test_find_jumps_threshold_is_overridable():
+    """The automatic threshold is reported, and an explicit one replaces it."""
+    time_h, values = _series()
+    stepped = values.copy()
+    stepped[240:] += 1.4e4
+    _, auto = find_jumps(time_h, stepped)
+    assert np.isfinite(auto) and auto > 0
+    tight, _ = find_jumps(time_h, stepped, threshold=1.0)
+    loose, _ = find_jumps(time_h, stepped, threshold=1e9)
+    assert len(tight) > 1, 'a 1 m/s per hour limit should flag ordinary variation too'
+    assert len(loose) == 0, 'nothing should clear a 1e9 limit'
+    return f'auto threshold {auto:.1f} m/s per h; explicit 1.0 -> {len(tight)} jumps, 1e9 -> 0'
 
 
 def test_moving_average_smooths_out_the_period():

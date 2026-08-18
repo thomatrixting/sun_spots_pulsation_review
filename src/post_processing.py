@@ -101,8 +101,21 @@ def match_coefficients_to_times(
 
 
 def _broadcast(c: np.ndarray) -> np.ndarray:
-    """(n_t,) -> (n_t, 1, 1) for broadcasting against (n_t, ny, nx) cubes."""
-    return np.asarray(c, dtype=np.float32)[:, None, None]
+    """(n_t,) -> (n_t, 1, 1) for broadcasting against (n_t, ny, nx) cubes.
+
+    Rejects anything already shaped for broadcasting. Applying this twice gives
+    (n_t, 1, 1, 1, 1), which right-aligns against an (n_t, ny, nx) cube into a
+    frames x frames outer product — for a 480-frame 648x648 cube, 360 GiB. Numpy
+    is happy to try, so the guard has to be here.
+    """
+    c = np.asarray(c, dtype=np.float32)
+    if c.ndim != 1:
+        raise ValueError(
+            f'coefficients must be 1-D (n_t,), got shape {c.shape}. '
+            'apply_cubic/invert_cubic broadcast per-frame coefficients themselves — '
+            'pass match_coefficients_to_times() output straight through.'
+        )
+    return c[:, None, None]
 
 
 def apply_cubic(x: np.ndarray, c0: np.ndarray, c1: np.ndarray, c2: np.ndarray, c3: np.ndarray) -> np.ndarray:
@@ -185,12 +198,16 @@ def v_b_from_vlcp_rcp(V_lcp: np.ndarray, V_rcp: np.ndarray, k: float = K) -> tup
     return V, B
 
 
-def reconstruct_cubes(cube_dop, cube_mag, obs_times, k=K, pad_hours=24.0, verbose=True):
+def reconstruct_cubes(cube_dop, cube_mag, obs_times, k=K, pad_hours=24.0, chunk_frames=32, verbose=True):
     """Rebuild dopplergram and magnetogram cubes with HMI's cubic calibration inverted.
 
     Generalised from the loop that used to sit in `01B`: fetch the coefficients covering
     the observation window, match each frame to the 12 h window it falls in, split V and B
     into the two circular polarisations, invert the cubic on each, and recombine.
+
+    Processed `chunk_frames` frames at a time (set to None to do the whole cube at once) —
+    `invert_cubic` holds several full-size intermediates per call, so chunking bounds peak
+    memory instead of scaling it with the whole cube.
 
     Returns `(cube_dop_reconstructed, cube_mag_reconstructed)`.
     """
@@ -198,16 +215,22 @@ def reconstruct_cubes(cube_dop, cube_mag, obs_times, k=K, pad_hours=24.0, verbos
 
     times = Time(obs_times)
     coefficients = fetch_coefficients(times.min(), times.max(), pad_hours=pad_hours)
-    matched = match_coefficients_to_times(times, coefficients)
-    c0, c1, c2, c3 = (_broadcast(matched[f'COEFF{i}'].to_numpy()) for i in range(4))
+    c0, c1, c2, c3 = match_coefficients_to_times(times, coefficients)
 
-    v_lcp, v_rcp = vlcp_rcp_from_v_b(cube_dop, cube_mag, k=k)
-    v_lcp_raw = invert_cubic(v_lcp, c0, c1, c2, c3)
-    v_rcp_raw = invert_cubic(v_rcp, c0, c1, c2, c3)
-    dop, mag = v_b_from_vlcp_rcp(v_lcp_raw, v_rcp_raw, k=k)
+    n_t = cube_dop.shape[0]
+    dop = np.empty(cube_dop.shape, dtype=np.float32)
+    mag = np.empty(cube_mag.shape, dtype=np.float32)
+
+    step = n_t if chunk_frames is None else int(chunk_frames)
+    for start in range(0, n_t, step):
+        sl = slice(start, min(start + step, n_t))
+        v_lcp, v_rcp = vlcp_rcp_from_v_b(cube_dop[sl], cube_mag[sl], k=k)
+        v_lcp_raw = invert_cubic(v_lcp, c0[sl], c1[sl], c2[sl], c3[sl])
+        v_rcp_raw = invert_cubic(v_rcp, c0[sl], c1[sl], c2[sl], c3[sl])
+        dop[sl], mag[sl] = v_b_from_vlcp_rcp(v_lcp_raw, v_rcp_raw, k=k)
 
     if verbose:
-        print(f'{len(matched)} frame(s) matched to {coefficients["T_REC"].nunique()} '
+        print(f'{n_t} frame(s) matched to {coefficients["T_REC"].nunique()} '
               f'coefficient window(s)')
     return dop, mag
 

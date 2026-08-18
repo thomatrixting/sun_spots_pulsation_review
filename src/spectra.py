@@ -80,6 +80,115 @@ def detrend_poly(time, series, degree=1):
     return values - np.polyval(coefficients, time)
 
 
+def find_jumps(time, series, threshold=None, n_sigma=8.0, n_slope=3):
+    """Locate step discontinuities: intervals whose slope is absurd next to the rest.
+
+    A step is not a fast oscillation. The separation is enormous — a wrong-branch root in
+    `post_processing.invert_cubic` moves the reconstructed velocity by ~1e4 m/s between
+    one 720 s frame and the next, while the real signal moves by tens — so the threshold
+    only has to sit somewhere in that gap. Left as None it is placed automatically at
+    `n_sigma` times a median-absolute-deviation estimate of the slope scatter, which
+    adapts to a region's own noise instead of hardcoding a limit that suits one cube.
+    The limit is on how far an interval's slope departs from the series' *typical* slope.
+
+    Only finite samples take part, so a NaN gap neither hides a step that straddles it
+    nor contributes a spurious one of its own.
+
+    `n_slope` sets how many clean intervals before a step are used to predict what it
+    should have been; see `remove_jumps`, which is what acts on that prediction.
+
+    Returns `(jumps, threshold)`. `jumps` is a DataFrame with one row per step — `index`
+    (the first sample of the shifted segment, in the original array's indexing), `time`,
+    `slope`, `step`, `expected` and `offset` — and `threshold` is the limit actually used.
+    """
+    t = np.asarray(time, dtype=float)
+    y = np.asarray(series, dtype=float)
+    good = np.flatnonzero(np.isfinite(t) & np.isfinite(y))
+
+    columns = ['index', 'time', 'slope', 'step', 'expected', 'offset']
+    if good.size < 3:
+        return pd.DataFrame(columns=columns), np.nan
+
+    step = np.diff(y[good])
+    dt = np.diff(t[good])
+    slope = step / dt
+
+    # Measured against the series' typical slope, not against zero, so a series that is
+    # genuinely climbing is not read as one long jump. For these light curves the median
+    # slope is near zero anyway and the two are the same test.
+    centre = np.median(slope)
+    if threshold is None:
+        # MAD rather than a standard deviation: the steps being looked for are exactly the
+        # outliers that would inflate an ordinary sigma and hide themselves behind it.
+        sigma = 1.4826 * np.median(np.abs(slope - centre))
+        # A series whose slope is constant has a MAD at rounding level, not zero, and
+        # n_sigma times that would flag every interval in it. Floor the scale at a
+        # relative fraction of the slope itself so straight lines survive intact.
+        scale = max(sigma, 1e-6 * np.median(np.abs(slope)))
+        threshold = n_sigma * scale
+
+    is_jump = np.abs(slope - centre) > threshold
+    flagged = np.flatnonzero(is_jump)
+    clean = np.flatnonzero(~is_jump)
+
+    rows = []
+    for j in flagged:
+        # The slope the series had before the step, to say what the two points now either
+        # side of it should differ by. A median of the last few clean intervals rather than
+        # just the last one: a single 720 s difference of a noisy series is itself noisy,
+        # and that noise would go straight into the offset.
+        previous = clean[clean < j][-max(1, int(n_slope)):]
+        # A step in the very first interval has nothing before it to measure. Falling back
+        # to zero flattens it outright, which is the honest answer when there is no slope
+        # to preserve.
+        reference = float(np.median(slope[previous])) if previous.size else 0.0
+        expected = reference * dt[j]
+        rows.append((int(good[j + 1]), float(t[good[j + 1]]), float(slope[j]),
+                     float(step[j]), float(expected), float(step[j] - expected)))
+
+    return pd.DataFrame(rows, columns=columns), float(threshold)
+
+
+def remove_jumps(time, series, threshold=None, n_sigma=8.0, n_slope=3):
+    """Subtract each step so the series is continuous, keeping the local slope across it.
+
+    Two stages at every step `find_jumps` reports. Subtract the whole difference, which
+    makes the seam flat, then add back the forward-Euler increment `slope * dt` that the
+    interval should have had — otherwise the correction replaces a discontinuity in the
+    value with one in the derivative, a visible kink where the step used to be. Net, the
+    offset removed is the *excess* over what the local slope predicted, and offsets
+    accumulate so a segment is shifted by every step before it.
+
+    **Conditioning, not repair.** This makes a stepped series usable by an FFT or a 24 h
+    fit, which a step function otherwise dominates. It does not recover the values that
+    should have been there: each segment keeps whatever branch it was reconstructed on, so
+    after the first jump only *relative* levels mean anything. `n_slope=1` is the literal
+    "use the previous slope"; the default takes a short median instead.
+
+    It also assumes a step *settles*. If the reported offsets alternate in sign the series
+    is flipping between branches frame to frame rather than moving to a new level, and
+    de-stepping is the wrong description of what is wrong with it — the reconstructed
+    magnetogram series do this, where the velocity ones mostly step cleanly.
+
+    Returns `(corrected, jumps)`.
+    """
+    jumps, _ = find_jumps(time, series, threshold=threshold, n_sigma=n_sigma,
+                          n_slope=n_slope)
+
+    y = np.asarray(series, dtype=float)
+    if jumps.empty:
+        return y, jumps
+
+    # Scatter the running total onto the original axis: a sample carries the sum of every
+    # offset whose jump index is at or before it. searchsorted does that in one pass, and
+    # keeps working when the jumps sit either side of a gap.
+    edges = jumps['index'].to_numpy()
+    cumulative = np.cumsum(jumps['offset'].to_numpy())
+    which = np.searchsorted(edges, np.arange(len(y)), side='right') - 1
+    correction = np.where(which >= 0, cumulative[np.clip(which, 0, None)], 0.0)
+    return y - correction, jumps
+
+
 def resample_uniform(time_h, series, detrend_deg=None):
     """Put a series on a uniform time grid, interpolating gaps, optionally detrended.
 
