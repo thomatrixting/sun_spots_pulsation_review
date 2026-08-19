@@ -410,6 +410,7 @@ def plot_time_series(
     plots_dir: str | pathlib.Path | None = None,
     mag_residual: bool = False,
     subtract_quiet: bool = False,
+    do_not_show_quiet: bool = False,
 ) -> None:
     """
     Plot mean B and Doppler velocity vs time for umbra, penumbra, both, and quiet sun.
@@ -421,6 +422,7 @@ def plot_time_series(
     normalized : if True, min-max normalize each series before plotting
     save       : if True, save the figure to plots_dir
     plots_dir  : directory for saved figures (required when save=True)
+    do_not_show_quiet : if True, do not show the quiet sun series
     """
     time_h = data['time_h']
 
@@ -443,12 +445,20 @@ def plot_time_series(
             ('Quiet Sun', metrics['mean_mag_quiet'], metrics['mean_dop_quiet'], 'black'),
         ]
     else:
-         series = [
-            ('Umbra',     metrics['mean_mag_umb_residual'],   metrics['mean_dop_umb'],   'red'),
-            ('Penumbra',  metrics['mean_mag_pen_residual'],   metrics['mean_dop_pen'],   'blue'),
-            ('Both',      metrics['mean_mag_both_residual'],  metrics['mean_dop_both'],  'purple'),
-            ('Quiet Sun', None, metrics['mean_dop_quiet'], 'black'),
-        ]
+         if not do_not_show_quiet:
+            series = [
+                ('Umbra',     metrics['mean_mag_umb_residual'],   metrics['mean_dop_umb'],   'red'),
+                ('Penumbra',  metrics['mean_mag_pen_residual'],   metrics['mean_dop_pen'],   'blue'),
+                ('Both',      metrics['mean_mag_both_residual'],  metrics['mean_dop_both'],  'purple'),
+                ('Quiet Sun', None, metrics['mean_dop_quiet'], 'black'),
+            ]
+         else:
+            series = [
+                ('Umbra',     metrics['mean_mag_umb_residual'],   metrics['mean_dop_umb'],   'red'),
+                ('Penumbra',  metrics['mean_mag_pen_residual'],   metrics['mean_dop_pen'],   'blue'),
+                ('Both',      metrics['mean_mag_both_residual'],  metrics['mean_dop_both'],  'purple'),
+                ('Quiet Sun', None, None, 'black'),
+            ]
 
     hotspot_mag = metrics.get('mean_mag_hotspot')
 

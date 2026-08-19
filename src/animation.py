@@ -15,7 +15,7 @@ import numpy as np
 from scipy import ndimage
 from matplotlib.animation import FuncAnimation, HTMLWriter
 
-from .plotting import save_figure  # noqa: F401  (kept for parity with the other modules)
+from .plotting import save_figure, symmetric_limits  # noqa: F401  (save_figure: parity)
 
 def save_animation(
     data: dict,
@@ -25,7 +25,8 @@ def save_animation(
     fps: int = 5,
     embed_limit_mb: float = 50.0,
     mag_symmetric_cbar: bool = True,
-    embed_frames: bool = True,
+    dop_symmetric_cbar: bool = True,
+    embed_frames: bool = False,
 ) -> None:
     """
     Save a 3-channel (continuum / magnetogram / dopplergram) animation as HTML.
@@ -43,10 +44,15 @@ def save_animation(
                          False writes them to a sibling ``<name>_frames/`` directory
                          instead — smaller, but the .html breaks if it is moved without
                          that directory. Raise ``step`` if an embedded file gets too big.
-    mag_symmetric_cbar : if True, use a symmetric colorbar for the magnetogram
-                         channel centred at zero (vmin = −vmax where vmax is the
-                         99th percentile of |B| across all frames).  Default False
-                         keeps the original [2nd, 98th] percentile limits.
+    mag_symmetric_cbar : if True (the default), centre the magnetogram colorbar on zero:
+                         vmin = −vmax, with vmax the 99th percentile of |B| over the
+                         sampled frames. False keeps the [2nd, 98th] percentile limits.
+    dop_symmetric_cbar : the same for the dopplergram, and on by default for the same
+                         reason. `RdBu_r` is a diverging colormap, so an asymmetric range
+                         puts zero velocity somewhere other than the white midpoint — a
+                         blueshift then reads as a different size from a redshift of equal
+                         magnitude, and the panel cannot be compared frame to frame or
+                         against the magnetogram beside it.
     """
     save_path = pathlib.Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -69,9 +75,14 @@ def save_animation(
     _sample    = np.arange(0, n_t, max(1, n_t // 50))
     clims      = [np.nanpercentile(c[_sample], [2, 98]) for c in cubes_ch]
 
-    if mag_symmetric_cbar:
-        mag_vmax = float(np.nanpercentile(np.abs(cube_mag[_sample]), 99))
-        clims[1] = np.array([-mag_vmax, mag_vmax])
+    # Both signed channels go on diverging colormaps, where the midpoint colour *is* the
+    # zero. `symmetric_limits` is the same rule the still figures in `analysis` use, so a
+    # frame grabbed from the animation and one plotted directly share a scale — and it
+    # falls back to a usable limit on an all-NaN sample, which a bare percentile does not.
+    for channel, symmetric in ((1, mag_symmetric_cbar), (2, dop_symmetric_cbar)):
+        if symmetric:
+            vmax = symmetric_limits(cubes_ch[channel][_sample], percentile=99)
+            clims[channel] = np.array([-vmax, vmax])
 
     _LEGEND_HANDLES = [
         mpatches.Patch(color=(0.0, 0.85, 0.0, 0.75), label='Umbra'),
@@ -97,7 +108,7 @@ def save_animation(
         return rgba
 
     fig, axes = plt.subplots(1, 3, figsize=(19, 6))
-    fig.subplots_adjust(wspace=0.55, top=0.88, left=0.06, right=0.97)
+    fig.subplots_adjust(wspace=0.3, top=0.88, left=0.06, right=0.97)
     ims = []; overlays = []
 
     for idx, (ax, cube, cmap, clim, lbl) in enumerate(
