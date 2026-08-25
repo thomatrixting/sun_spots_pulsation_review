@@ -380,6 +380,18 @@ def add_mag_residuals(data: dict, metrics: dict, degree: int = 2) -> dict:
     effects) from the magnetogram time series before pulsation analysis.
     Generalizes the fit done ad hoc in notebooks/03_data_analisis.ipynb.
 
+    Every ``mean_mag_*`` series in ``metrics`` is covered, quiet Sun included —
+    a hardcoded region list left ``mean_mag_quiet_residual`` missing, and the
+    spectra that ask for it then came back a panel short. Two robustness points
+    matter for real cubes:
+
+    * ``np.polyfit`` propagates NaNs, so a single gap used to turn a whole
+      residual series into NaN. The fit is done on the finite samples only.
+    * the quiet-Sun series is measured on its own cube and need not have the
+      same length as ``time_h``. When it does not, the fit runs against the
+      sample index, which for a uniform cadence is the same polynomial up to a
+      linear change of variable and so leaves the residual unchanged.
+
     Parameters
     ----------
     data    : dict from load_ds0n_region() / masks_from_cubes()
@@ -390,15 +402,19 @@ def add_mag_residuals(data: dict, metrics: dict, degree: int = 2) -> dict:
     -------
     metrics, with the added ``_residual`` keys.
     """
-    time_h = data['time_h']
-    for region in ('umb', 'pen', 'both', 'hotspot'):
-        key = f'mean_mag_{region}'
-        if key not in metrics:
+    time_h = np.asarray(data['time_h'], dtype=float)
+    keys = [k for k in list(metrics)
+            if k.startswith('mean_mag_') and not k.endswith('_residual')]
+
+    for key in keys:
+        series = np.asarray(metrics[key], dtype=float)
+        x = time_h if series.size == time_h.size else np.arange(series.size, dtype=float)
+        good = np.isfinite(series) & np.isfinite(x)
+        if good.sum() < degree + 2:
+            print(f'add_mag_residuals: {key} has {good.sum()} usable samples — skipped')
             continue
-        series = metrics[key]
-        coeffs = np.polyfit(time_h, series, degree)
-        fit = np.polyval(coeffs, time_h)
-        metrics[f'{key}_residual'] = series - fit
+        coeffs = np.polyfit(x[good], series[good], degree)
+        metrics[f'{key}_residual'] = series - np.polyval(coeffs, x)
     return metrics
 
 

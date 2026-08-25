@@ -389,25 +389,64 @@ def band_amplitude(time_h, series, band_h=(16.0, 36.0), pad_factor=8, detrend_de
 
 # ── per-region helpers ────────────────────────────────────────────────────────
 
+def resolve_series_key(metrics, key, suffix):
+    """The name under which `metrics` stores `key` for the region `suffix`, or None.
+
+    The region does not always go at the end. `compute_metrics` names its series
+    `mean_dop_<region>`, but `analysis.add_mag_residuals` qualifies them further and
+    writes `mean_mag_<region>_residual` — so asking for `key='mean_mag_residual'` and
+    appending the suffix looks for `mean_mag_residual_umb`, which never exists. That
+    mismatch is what silently emptied every magnetogram spectrum.
+
+    So instead of assuming a position, try the suffix at each token boundary, rightmost
+    first: `mean_mag_residual` + `umb` tries `mean_mag_residual_umb`, then
+    `mean_mag_umb_residual` — the one that is there. A key that already names a region
+    (`mean_mag_pen_residual`) resolves to itself.
+    """
+    tokens = key.split('_')
+    if suffix in tokens:
+        return key if key in metrics else None
+    for i in range(len(tokens), -1, -1):
+        candidate = '_'.join(tokens[:i] + [suffix] + tokens[i:])
+        if candidate in metrics:
+            return candidate
+    return None
+
+
 def region_spectra(metrics, cadence_s, kind='fft', key='mean_dop', regions=DEFAULT_REGIONS,
-                   **kwargs):
+                   quiet=False, **kwargs):
     """Spectra for the four regions at once.
 
     Returns a list of `(label, freq_mhz, power, colour)`, which is what every plot below
     consumes. `key` picks the quantity: 'mean_dop' for velocity, 'mean_mag' for field,
     'mean_mag_residual' for the parabola-subtracted field (see `analysis.add_mag_residuals`).
+    Where in the name the region goes is `resolve_series_key`'s problem, not the caller's.
+
+    A region `metrics` has no series for is skipped with a note; a `key` no region
+    resolves raises, because the alternative — returning `[]` — draws a plot that is
+    simply missing a curve and says nothing about why.
     """
     estimate = {'fft': fft_spectrum, 'psd': psd_spectrum}.get(kind)
     if estimate is None:
         raise ValueError(f"kind must be 'fft' or 'psd', got {kind!r}")
 
-    out = []
+    out, missing = [], []
     for label, suffix, colour in regions:
-        series_key = f'{key}_{suffix}' if not key.endswith(suffix) else key
-        if series_key not in metrics:
+        series_key = resolve_series_key(metrics, key, suffix)
+        if series_key is None:
+            missing.append(f'{label} ({suffix})')
             continue
         freq, power = estimate(metrics[series_key], cadence_s, **kwargs)
         out.append((label, freq, power, colour))
+
+    if not out:
+        available = ', '.join(sorted(k for k in metrics if isinstance(k, str))[:20])
+        raise KeyError(
+            f'no region in metrics matches key={key!r}. Tried every position for the '
+            f'suffixes {[s for _, s, _ in regions]}. '
+            f'Is add_mag_residuals() still to be run? Keys present: {available}')
+    if missing and not quiet:
+        print(f'region_spectra: no {key!r} series for {", ".join(missing)} — skipped')
     return out
 
 
@@ -535,9 +574,15 @@ def plot_spectra_combined(spectra, cadence_s, kind='fft', title_extra='', xlim=N
     return peaks
 
 
+def _slug(text):
+    """`Magnetogram residual` → `magnetogram_residual`, for use in a filename."""
+    return ''.join(c if c.isalnum() else '_' for c in text.lower()).strip('_')
+
+
 def plot_spectra_compare(spectra_a, spectra_b, cadence_s, label_a='Dopplergram',
                          label_b='Magnetogram', kind='psd', normalize=False, xlim=None,
-                         log_y=False, save=False, plots_dir=None, filename=None):
+                         log_y=False, print_table=True, save=False, plots_dir=None,
+                         filename=None):
     """Two quantities' spectra per region, overlaid — one panel per region.
 
     The question it answers: does the field oscillate at the same period as the velocity,
@@ -548,8 +593,15 @@ def plot_spectra_compare(spectra_a, spectra_b, cadence_s, label_a='Dopplergram',
     `normalize` scales each curve by its own maximum, which is the only way to see two
     quantities with different units on one axis — at the cost of every statement about
     relative size.
+
+    A peak table is printed for *both* quantities, not just the velocity one: reading a
+    period off the magnetogram curve by eye is exactly what the table exists to avoid,
+    and the numbers are what say whether the two peaks are the same period or merely
+    close. Returns `(peaks_a, peaks_b)`; saved as `<kind>_peaks_<label>.csv` per
+    quantity, so neither overwrites the table `plot_spectra_combined` writes.
     """
-    y_label, _, kind_label = _spectrum_labels(kind)
+    y_label, value_label, kind_label = _spectrum_labels(kind)
+    peaks_a, peaks_b = peak_table(spectra_a), peak_table(spectra_b)
     by_label_b = {label: (freq, power) for label, freq, power, _ in spectra_b}
 
     n = len(spectra_a)
@@ -578,6 +630,19 @@ def plot_spectra_compare(spectra_a, spectra_b, cadence_s, label_a='Dopplergram',
     save_figure(fig, plots_dir, filename or f'{kind}_compare.png', save)
     plt.show()
     plt.close(fig)
+
+    for label, peaks in ((label_a, peaks_a), (label_b, peaks_b)):
+        if peaks.empty:
+            if print_table:
+                print(f'\n{label}: no peaks above the threshold.')
+            continue
+        if print_table:
+            print(f'\n{label} — {kind_label} peaks')
+            print_peak_table(peaks, value_label)
+        if save:
+            save_peak_table(peaks, plots_dir, f'{kind}_peaks_{_slug(label)}.csv')
+
+    return peaks_a, peaks_b
 
 
 def plot_spectrum_before_after(series, cadence_s, period_min, label='', width_mhz=0.0002,

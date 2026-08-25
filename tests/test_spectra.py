@@ -20,7 +20,9 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+from src.analysis import add_mag_residuals  # noqa: E402
 from src.spectra import (  # noqa: E402
+    DEFAULT_REGIONS,
     band_amplitude,
     detrend_poly,
     fft_spectrum,
@@ -28,8 +30,11 @@ from src.spectra import (  # noqa: E402
     interpolate_gaps,
     moving_average,
     notch_filter,
+    peak_table,
     psd_spectrum,
+    region_spectra,
     remove_jumps,
+    resolve_series_key,
     spectral_peaks,
 )
 
@@ -330,7 +335,87 @@ def test_spectral_peaks_finds_the_tone():
     return f'top peak {top["period_min"] / 60:.2f} h, relative {top["relative"]:.3f}'
 
 
-# ── equivalence to what came before ───────────────────────────────────────────
+# ── per-region key resolution ─────────────────────────────────────────────────
+
+def _metrics(regions=('umb', 'pen', 'both', 'quiet'), residuals=True):
+    """A metrics dict shaped like `analysis.compute_metrics` + `add_mag_residuals`."""
+    _, values = _series(noise=3.0)
+    out = {}
+    for suffix in regions:
+        out[f'mean_dop_{suffix}'] = values.copy()
+        out[f'mean_mag_{suffix}'] = values.copy() * 10
+        if residuals:
+            out[f'mean_mag_{suffix}_residual'] = values.copy()
+    return out
+
+
+def test_resolve_series_key_places_the_region_before_a_qualifier():
+    metrics = _metrics()
+    cases = {
+        ('mean_dop', 'umb'): 'mean_dop_umb',
+        ('mean_mag', 'quiet'): 'mean_mag_quiet',
+        # The residual is stored as mean_mag_<region>_residual, so appending the region
+        # to the key is wrong — the region goes in the middle.
+        ('mean_mag_residual', 'umb'): 'mean_mag_umb_residual',
+        ('mean_mag_residual', 'both'): 'mean_mag_both_residual',
+        # A key that already names its region resolves to itself.
+        ('mean_mag_pen_residual', 'pen'): 'mean_mag_pen_residual',
+    }
+    for (key, suffix), expected in cases.items():
+        got = resolve_series_key(metrics, key, suffix)
+        assert got == expected, f'{key!r} + {suffix!r} -> {got!r}, expected {expected!r}'
+    assert resolve_series_key(metrics, 'mean_nothing', 'umb') is None
+    return f'{len(cases)} key shapes resolved'
+
+
+def test_region_spectra_finds_the_magnetogram_residual():
+    metrics = _metrics()
+    got = region_spectra(metrics, CADENCE_S, kind='psd', key='mean_mag_residual')
+    labels = [label for label, _, _, _ in got]
+    expected = [label for label, _, _ in DEFAULT_REGIONS]
+    assert labels == expected, f'{labels} != {expected}'
+    assert all(power.size for _, _, power, _ in got), 'a region came back empty'
+    return f'{len(got)} regions: {", ".join(labels)}'
+
+
+def test_region_spectra_raises_when_no_region_resolves():
+    metrics = _metrics()
+    try:
+        region_spectra(metrics, CADENCE_S, kind='psd', key='mean_typo')
+    except KeyError as exc:
+        assert 'mean_typo' in str(exc), f'unhelpful message: {exc}'
+        return 'a key matching nothing raises instead of returning []'
+    raise AssertionError('a key matching nothing returned quietly')
+
+
+def test_add_mag_residuals_covers_every_region_and_survives_nans():
+    time_h, values = _series()
+    trend = 0.01 * time_h ** 2 - 0.4 * time_h + 120
+    metrics = {f'mean_mag_{s}': values + trend for s in ('umb', 'pen', 'both', 'quiet')}
+    metrics['mean_mag_quiet'] = metrics['mean_mag_quiet'].copy()
+    metrics['mean_mag_quiet'][5:9] = np.nan
+    add_mag_residuals({'time_h': time_h}, metrics)
+
+    for suffix in ('umb', 'pen', 'both', 'quiet'):
+        key = f'mean_mag_{suffix}_residual'
+        assert key in metrics, f'{key} missing'
+        residual = metrics[key]
+        finite = np.isfinite(residual)
+        assert finite.sum() > len(residual) - 10, f'{key} is mostly NaN'
+        assert abs(np.nanmean(residual)) < 1.0, f'{key} keeps its trend'
+    return 'residuals for 4 regions, NaNs confined to the gap'
+
+
+def test_peak_table_labels_each_region():
+    metrics = _metrics()
+    spectra_mag = region_spectra(metrics, CADENCE_S, kind='psd', key='mean_mag_residual')
+    peaks = peak_table(spectra_mag)
+    assert not peaks.empty, 'no peaks found for the magnetogram residual'
+    assert set(peaks['region']) == {label for label, _, _ in DEFAULT_REGIONS}
+    return f'{len(peaks)} magnetogram peaks across {peaks["region"].nunique()} regions'
+
+
+# ── equivalence to what came before ─────────────────────────────────────────
 
 def test_fft_spectrum_matches_the_old_fft():
     _, values = _series(noise=5.0)
