@@ -7,6 +7,7 @@ import — is only loaded when an animation is actually wanted.
 from __future__ import annotations
 
 import pathlib
+from collections.abc import Sequence
 
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
@@ -27,6 +28,7 @@ def save_animation(
     mag_symmetric_cbar: bool = True,
     dop_symmetric_cbar: bool = True,
     embed_frames: bool = False,
+    panel_titles: Sequence[str] | None = None,
 ) -> None:
     """
     Save a 3-channel (continuum / magnetogram / dopplergram) animation as HTML.
@@ -53,6 +55,11 @@ def save_animation(
                          blueshift then reads as a different size from a redshift of equal
                          magnitude, and the panel cannot be compared frame to frame or
                          against the magnetogram beside it.
+    panel_titles       : three titles, one per panel. The default names the channels —
+                         Continuum / Magnetogram / Dopplergram — above the boxes, where
+                         the colorbar label is the last thing a projected figure is read
+                         for. The units stay on the colorbar, so the title says what the
+                         panel *is* and the colorbar what its colours mean.
     """
     save_path = pathlib.Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -72,6 +79,8 @@ def save_animation(
     cubes_ch   = [cube_cont,        cube_mag,           cube_dop]
     cmaps_ch   = ['gray',           'bwr',              'RdBu_r']
     labels_ch  = ['Continuum (DN)', 'Magnetogram (G)',  'Dopplergram (m/s)']
+    titles_ch  = (list(panel_titles) if panel_titles is not None
+                  else ['Continuum', 'Magnetogram', 'Dopplergram'])
     _sample    = np.arange(0, n_t, max(1, n_t // 50))
     clims      = [np.nanpercentile(c[_sample], [2, 98]) for c in cubes_ch]
 
@@ -108,14 +117,17 @@ def save_animation(
         return rgba
 
     fig, axes = plt.subplots(1, 3, figsize=(19, 6))
-    fig.subplots_adjust(wspace=0.3, top=0.88, left=0.06, right=0.97)
+    # top=0.86 rather than 0.88: the panel titles go in the band the suptitle
+    # used to have to itself.
+    fig.subplots_adjust(wspace=0.3, top=0.86, left=0.06, right=0.97)
     ims = []; overlays = []
 
-    for idx, (ax, cube, cmap, clim, lbl) in enumerate(
-            zip(axes, cubes_ch, cmaps_ch, clims, labels_ch)):
+    for idx, (ax, cube, cmap, clim, lbl, title) in enumerate(
+            zip(axes, cubes_ch, cmaps_ch, clims, labels_ch, titles_ch)):
         im = ax.imshow(cube[0], origin='lower', cmap=cmap,
                        vmin=clim[0], vmax=clim[1], interpolation='nearest')
         fig.colorbar(im, ax=ax, label=lbl, fraction=0.046, pad=0.06)
+        ax.set_title(title, fontsize=12)
         ov_data = (_make_filled_rgba if idx == 0 else _make_outline_rgba)(umbra[0], penumbra[0])
         ov = ax.imshow(ov_data, origin='lower', interpolation='nearest')
         ax.set_xlabel('X (px)')
