@@ -12,7 +12,8 @@ Two datasets feed the same analysis:
 * **NOAA** (line A) — active regions queried, downloaded and corrected here.
   `data/raw/NOAA_<noaa>_<date>/` -> `data/processed/NOAA_<noaa>_<date>/`
 * **DS0N** (line B) — the `sebastian_sun_spots` set, delivered already processed.
-  `data/raw/sebastian_sun_spots/DS00..DS11/`
+  `data/raw/sebastian_sun_spots/DS<nn>/`, discovered by `ds0n_regions()` rather than
+  listed here, so a newly delivered dataset needs no edit to this file.
 
 They keep separate loaders (`loaders.load_noaa_region` / `loaders.load_ds0n_region`)
 because their thresholds mean different things: NOAA cuts are *fractions* of each
@@ -22,6 +23,7 @@ frame's own quiet-sun intensity, DS0N cuts are absolute DN.
 from __future__ import annotations
 
 import pathlib
+import re
 
 import astropy.units as u
 import numpy as np
@@ -133,19 +135,13 @@ PROCESSING = dict(
 
 
 # ── line B: which delivered datasets ──────────────────────────────────────────
-# DS00..DS11 exist on disk. The old notebooks each used a different subset (04 used
-# 00-09 in one cell and a hand-picked five in another); this is the one list.
+# There is no list here on purpose. `ds0n_regions()` reads whatever `DS<number>`
+# directories are sitting in `data/raw/sebastian_sun_spots/`, so a newly delivered
+# dataset shows up by being copied in, with nothing to edit in this file.
 #
-# Only DS00..DS09 actually load. DS10's cube_continuum.fits is truncated — astropy
-# refuses it with "buffer is too small for requested array" — and DS11 has no continuum
-# cube at all. `ds0n_regions()` filters on the file existing, which catches DS11 but not
-# DS10, so DS10 is excluded here explicitly until the file is re-delivered.
-DS0N_IDS = [f'DS{i:02d}' for i in range(10)]
-DS0N_IDS_ALL = [f'DS{i:02d}' for i in range(12)]
-DS0N_BROKEN = {
-    'DS10': 'cube_continuum.fits is truncated (buffer is too small for requested array)',
-    'DS11': 'no cube_continuum.fits',
-}
+# Nothing is filtered out either — a dataset whose cubes are missing or truncated is
+# still listed, and fails loudly in `03B` step 1 when it is actually loaded.
+DS0N_DIR_RE = re.compile(r'^DS(\d+)$')
 
 
 # ── segmentation defaults ─────────────────────────────────────────────────────
@@ -378,7 +374,18 @@ def processed_regions(pattern: str = 'NOAA_*') -> list[pathlib.Path]:
 
 
 def ds0n_regions(ids: list[str] | None = None) -> list[pathlib.Path]:
-    """DS0N raw directories that actually have a continuum cube, sorted."""
-    ids = DS0N_IDS if ids is None else ids
-    return [d for d in (DS0N_RAW_DIR / i for i in ids)
-            if (d / 'cube_continuum.fits').exists()]
+    """Every `DS<number>` directory under `data/raw/sebastian_sun_spots/`, in numeric order.
+
+    Discovery, not a registry: whatever is on disk is what comes back. Directories with
+    a suffix (`DS01_metadata`) are not datasets and are skipped; nothing else is, so a
+    dataset with missing or broken cubes is still returned and fails where it is loaded.
+
+    Pass `ids` to restrict the result to those names, in the order given.
+    """
+    if ids is not None:
+        return [DS0N_RAW_DIR / i for i in ids]
+    if not DS0N_RAW_DIR.is_dir():
+        return []
+    found = [(int(m.group(1)), d) for d in DS0N_RAW_DIR.iterdir()
+             if d.is_dir() and (m := DS0N_DIR_RE.match(d.name))]
+    return [d for _, d in sorted(found)]

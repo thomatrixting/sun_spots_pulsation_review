@@ -202,23 +202,56 @@ def resample_uniform(time_h, series, detrend_deg=None):
     if good.sum() < 4:
         return np.array([]), np.array([])
 
-    dt = float(np.median(np.diff(t)))
-    grid = np.arange(t[0], t[-1] + 0.5 * dt, dt)
-    values = np.interp(grid, t[good], y[good])
+    # `np.interp` assumes its x is increasing and returns nonsense — without complaining —
+    # when it is not. A DS0N timing file can carry an out-of-order timestamp (DS00 and DS05
+    # each have one frame dated ~3 days early), so sort rather than trust the file order.
+    order = np.argsort(t[good], kind='stable')
+    t_good, y_good = t[good][order], y[good][order]
+
+    dt = float(np.median(np.diff(t_good)))
+    grid = np.arange(t_good[0], t_good[-1] + 0.5 * dt, dt)
+    values = np.interp(grid, t_good, y_good)
     if detrend_deg is not None:
         values = detrend_poly(grid, values, detrend_deg)
     return grid, values
 
 
-def moving_average(series, cadence_s, window_min):
+def _on_uniform_grid(series, time_h, detrend_deg=None):
+    """`(grid_h, values)` ready for a transform: resampled when there is a time axis to use.
+
+    Returns `grid_h=None` — and falls back to `interpolate_gaps`, i.e. "assume the samples
+    are already evenly spaced" — when `time_h` is absent or does not describe this series.
+    The length check is not paranoia: the quiet-Sun series is measured on its own cube and
+    need not be as long as `time_h` (the same mismatch `analysis.add_mag_residuals` guards
+    against), and silently zipping the two would misdate every sample in it.
+    """
+    if time_h is not None and len(np.asarray(time_h)) == len(np.asarray(series)):
+        return resample_uniform(time_h, series, detrend_deg=detrend_deg)
+
+    values = interpolate_gaps(series)
+    if detrend_deg is not None:
+        values = detrend_poly(np.arange(len(values)), values, detrend_deg)
+    return None, values
+
+
+def moving_average(series, cadence_s, window_min, time_h=None):
     """Centred rolling mean over a window given in minutes.
 
     Used to strip the dominant ~24 h component and see what is underneath it. The window
     is converted to a whole number of frames, so the effective width is whatever that
     rounds to — the return value says which.
 
-    Returns `(smoothed, window_frames)`.
+    `time_h` makes the window mean what it says on a series whose cadence jumps: without
+    it, a rolling window of N frames spans N*cadence_s only if every frame really is that
+    far apart. Given it, the series is put on a uniform grid first (`resample_uniform`),
+    so N frames is N*cadence_s of real time everywhere.
+
+    Returns `(grid_h, smoothed, window_frames)`. `grid_h` is the grid the smoothed series
+    lives on, or None when `time_h` was not given — in which case the caller's own time
+    axis still matches, as it always did.
     """
+    grid_h, series = _on_uniform_grid(series, time_h)
+
     cadence_min = cadence_s / 60
     window = max(1, round(window_min / cadence_min))
     # min_periods matters: with a 120-frame window, a series carrying scattered gaps has a
@@ -226,10 +259,10 @@ def moving_average(series, cadence_s, window_min):
     # nearly everywhere. Half a window of real data is enough for a mean.
     smoothed = pd.Series(np.asarray(series, dtype=float)).rolling(
         window, center=True, min_periods=max(1, window // 2)).mean().to_numpy()
-    return smoothed, window
+    return grid_h, smoothed, window
 
 
-def notch_filter(series, cadence_s, period_min, width_mhz=0.0002):
+def notch_filter(series, cadence_s, period_min, width_mhz=0.0002, time_h=None):
     """Zero every frequency bin within `width_mhz` of 1/period_min, then transform back.
 
     A blunt instrument: it removes the tone *and* whatever real signal shares those bins,
@@ -239,15 +272,21 @@ def notch_filter(series, cadence_s, period_min, width_mhz=0.0002):
 
     `width_mhz` is a half-width. The default 0.0002 mHz is about 5 bins on a 3-day,
     720 s series.
+
+    `time_h` puts the series on a uniform grid before the transform, which is what makes
+    the notched frequency the frequency actually removed when the cadence is not constant.
+
+    Returns `(grid_h, filtered, n_bins)`; `grid_h` is None when `time_h` was not given.
     """
-    values = interpolate_gaps(series)
+    grid_h, values = _on_uniform_grid(series, time_h)
+
     freq_mhz = np.fft.rfftfreq(len(values), d=cadence_s) * 1e3
     spectrum = np.fft.rfft(values)
 
     target_mhz = 1e3 / (period_min * 60)
     band = np.abs(freq_mhz - target_mhz) < width_mhz
     spectrum[band] = 0
-    return np.fft.irfft(spectrum, n=len(values)), int(band.sum())
+    return grid_h, np.fft.irfft(spectrum, n=len(values)), int(band.sum())
 
 
 # ── estimation ────────────────────────────────────────────────────────────────
@@ -266,7 +305,7 @@ def _apply_window(values, window):
 
 
 def fft_spectrum(series, cadence_s, window=None, pad_factor=1, detrend_deg=None,
-                 scale='raw'):
+                 scale='raw', time_h=None):
     """Amplitude spectrum of a uniformly sampled series. Returns `(freq_mhz, amplitude)`.
 
     The DC bin is dropped: it is the mean, it dwarfs everything else on a velocity
@@ -281,10 +320,16 @@ def fft_spectrum(series, cadence_s, window=None, pad_factor=1, detrend_deg=None,
     scale : 'raw' gives `|X_k|` (what the old `_fft` returned, arbitrary units);
         'amplitude' gives `2|X_k| / sum(w)`, corrected for the window's coherent gain, so
         a pure sinusoid of semi-amplitude A reads back as A in the series' own units.
+    time_h : the series' real elapsed hours, i.e. `data['time_h']`. Without it every
+        sample is assumed to sit exactly `cadence_s` after the last one, so a dataset
+        whose cadence jumps has its peaks in the wrong place. With it the series is put
+        on a uniform grid first (`resample_uniform`) and the frequency axis means what it
+        says. A constant cadence gives the same answer either way, so passing it is
+        always safe.
     """
-    values = interpolate_gaps(series)
-    if detrend_deg is not None:
-        values = detrend_poly(np.arange(len(values)), values, detrend_deg)
+    _, values = _on_uniform_grid(series, time_h, detrend_deg=detrend_deg)
+    if values.size == 0:
+        return np.array([]), np.array([])
 
     n = len(values)
     windowed, gain = _apply_window(values, window)
@@ -299,19 +344,22 @@ def fft_spectrum(series, cadence_s, window=None, pad_factor=1, detrend_deg=None,
     return freq_mhz[1:], amplitude[1:]
 
 
-def psd_spectrum(series, cadence_s, window=None, detrend_deg=None):
+def psd_spectrum(series, cadence_s, window=None, detrend_deg=None, time_h=None):
     """One-sided power spectral density. Returns `(freq_mhz, power)` in units^2/Hz.
 
     The density normalisation is what makes two series of different length comparable —
     an amplitude spectrum's height depends on how many samples went into it, a PSD's does
     not. Use it to ask "where is the power", and `fft_spectrum(scale='amplitude')` to ask
     "how many m/s is that peak".
+
+    `time_h` does the same thing here as in `fft_spectrum` — see there.
     """
-    values = interpolate_gaps(series)
-    detrend = 'constant'
-    if detrend_deg is not None:
-        values = detrend_poly(np.arange(len(values)), values, detrend_deg)
-        detrend = False          # already done, and more thoroughly
+    _, values = _on_uniform_grid(series, time_h, detrend_deg=detrend_deg)
+    if values.size == 0:
+        return np.array([]), np.array([])
+    # The polynomial is already off when one was asked for; otherwise the mean still has to
+    # come off, which periodogram does itself.
+    detrend = False if detrend_deg is not None else 'constant'
 
     freq_hz, power = periodogram(values, fs=1.0 / cadence_s, window=window or 'boxcar',
                                  scaling='density', return_onesided=True, detrend=detrend)
@@ -414,13 +462,17 @@ def resolve_series_key(metrics, key, suffix):
 
 
 def region_spectra(metrics, cadence_s, kind='fft', key='mean_dop', regions=DEFAULT_REGIONS,
-                   quiet=False, **kwargs):
+                   quiet=False, time_h=None, **kwargs):
     """Spectra for the four regions at once.
 
     Returns a list of `(label, freq_mhz, power, colour)`, which is what every plot below
     consumes. `key` picks the quantity: 'mean_dop' for velocity, 'mean_mag' for field,
     'mean_mag_residual' for the parabola-subtracted field (see `analysis.add_mag_residuals`).
     Where in the name the region goes is `resolve_series_key`'s problem, not the caller's.
+
+    Pass `time_h=data['time_h']` for a dataset whose cadence is not constant — it goes
+    straight to `fft_spectrum`/`psd_spectrum`, where it is what makes the frequency axis
+    honest. See `fft_spectrum` for why it is safe on a constant cadence too.
 
     A region `metrics` has no series for is skipped with a note; a `key` no region
     resolves raises, because the alternative — returning `[]` — draws a plot that is
@@ -436,7 +488,7 @@ def region_spectra(metrics, cadence_s, kind='fft', key='mean_dop', regions=DEFAU
         if series_key is None:
             missing.append(f'{label} ({suffix})')
             continue
-        freq, power = estimate(metrics[series_key], cadence_s, **kwargs)
+        freq, power = estimate(metrics[series_key], cadence_s, time_h=time_h, **kwargs)
         out.append((label, freq, power, colour))
 
     if not out:
@@ -646,18 +698,24 @@ def plot_spectra_compare(spectra_a, spectra_b, cadence_s, label_a='Dopplergram',
 
 
 def plot_spectrum_before_after(series, cadence_s, period_min, label='', width_mhz=0.0002,
-                               kind='psd', xlim=None, save=False, plots_dir=None):
+                               kind='psd', xlim=None, save=False, plots_dir=None,
+                               time_h=None):
     """Spectrum before and after notching out one period, plus the filtered series.
 
     This is the check that makes `notch_filter` usable rather than merely available: it
     shows what was removed and, just as importantly, how much of the neighbourhood went
     with it.
+
+    `time_h` is passed through to the notch and to the spectra, so the figure says the
+    same thing on a dataset whose cadence jumps as on one where it does not.
     """
     estimate = {'fft': fft_spectrum, 'psd': psd_spectrum}[kind]
     y_label, _, kind_label = _spectrum_labels(kind)
 
-    filtered, n_bins = notch_filter(series, cadence_s, period_min, width_mhz=width_mhz)
-    freq_before, power_before = estimate(series, cadence_s)
+    grid_h, filtered, n_bins = notch_filter(series, cadence_s, period_min,
+                                            width_mhz=width_mhz, time_h=time_h)
+    freq_before, power_before = estimate(series, cadence_s, time_h=time_h)
+    # `filtered` already lives on the resampled grid, so it must not be resampled twice.
     freq_after, power_after = estimate(filtered, cadence_s)
     target_mhz = 1e3 / (period_min * 60)
 
@@ -675,10 +733,10 @@ def plot_spectrum_before_after(series, cadence_s, period_min, label='', width_mh
     ax_spec.legend(fontsize=8)
     ax_spec.set_title(f'{kind_label} before and after the notch  {label}')
 
-    time_h = np.arange(len(filtered)) * cadence_s / 3600
-    ax_time.plot(time_h, interpolate_gaps(series), color='steelblue', lw=0.7, alpha=0.6,
-                 label='before')
-    ax_time.plot(time_h, filtered, color='crimson', lw=0.9, label='after')
+    axis_h = grid_h if grid_h is not None else np.arange(len(filtered)) * cadence_s / 3600
+    _, before = _on_uniform_grid(series, time_h)
+    ax_time.plot(axis_h, before, color='steelblue', lw=0.7, alpha=0.6, label='before')
+    ax_time.plot(axis_h, filtered, color='crimson', lw=0.9, label='after')
     ax_time.set_xlabel('Time (h)')
     ax_time.set_ylabel('Mean velocity (m/s)')
     ax_time.grid(alpha=0.25)
@@ -696,6 +754,7 @@ def plot_spectrum_before_after(series, cadence_s, period_min, label='', width_mh
 def plot_ffts_separate(data, metrics, annotate_peaks=True, print_table=True,
                        save=False, plots_dir=None, key='mean_dop', **kwargs):
     """2x2 FFT amplitude per region. Thin wrapper over `plot_spectra_separate`."""
+    kwargs.setdefault('time_h', data.get('time_h'))
     spectra = region_spectra(metrics, data['cadence_s'], kind='fft', key=key, **kwargs)
     return plot_spectra_separate(spectra, data['cadence_s'], kind='fft',
                                  annotate_peaks=annotate_peaks, print_table=print_table,
@@ -705,6 +764,7 @@ def plot_ffts_separate(data, metrics, annotate_peaks=True, print_table=True,
 def plot_ffts_combined(data, metrics, xlim=None, annotate_peaks=True, print_table=True,
                        save=False, plots_dir=None, key='mean_dop', **kwargs):
     """FFT amplitudes overlaid. Thin wrapper over `plot_spectra_combined`."""
+    kwargs.setdefault('time_h', data.get('time_h'))
     spectra = region_spectra(metrics, data['cadence_s'], kind='fft', key=key, **kwargs)
     return plot_spectra_combined(spectra, data['cadence_s'], kind='fft', xlim=xlim,
                                  annotate_peaks=annotate_peaks, print_table=print_table,

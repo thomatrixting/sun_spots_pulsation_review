@@ -249,7 +249,7 @@ def plot_magnetogram_masks(
     plt.close(fig)
 
 
-def compute_metrics(data: dict) -> dict:
+def compute_metrics(data: dict, use_absolute_mag: bool = False) -> dict:
     """
     Compute per-frame mean magnetogram and Doppler velocity for each region.
 
@@ -265,12 +265,25 @@ def compute_metrics(data: dict) -> dict:
     Parameters
     ----------
     data : dict from load_ds0n_region()
+    use_absolute_mag : bool
+        Average ``|B|`` instead of the signed field for every magnetogram-derived series.
+        A bipolar sunspot's signed mean can partly cancel across a mask, which is not what
+        "how strong is the field here" means; ``|B|`` avoids that at the cost of the sign.
+        When True, every ``mean_mag_*`` key gets an ``_absolute`` suffix
+        (``mean_mag_umb_absolute``, etc.) instead of overwriting the signed-field name, and
+        the suffix used is also returned as ``result['mag_variant']`` so that
+        ``add_mag_residuals``, ``save_metrics_csv``, ``plot_time_series`` and
+        ``save_animation`` can find the right keys without being told twice.
 
     Returns
     -------
-    dict with 1-D arrays: mean_mag_{umb,pen,both,quiet}, mean_dop_{umb,pen,both,quiet},
-    area_{umb,pen,both}.  If ``data['hot_spot']`` is not None, also includes
-    mean_mag_hotspot, area_hotspot (magnetogram only — no Doppler for hot_spot).
+    dict with 1-D arrays: mean_mag_{umb,pen,both,quiet}[_absolute], mean_dop_{umb,pen,both,quiet},
+    area_{umb,pen,both}, and ``mag_variant`` (``'_absolute'`` or ``''``).  If ``data['hot_spot']``
+    is not None, also includes mean_mag_hotspot[_absolute], area_hotspot (magnetogram only — no
+    Doppler for hot_spot). If ``data['cube_mu']`` is not None (i.e. ``load_ds0n_region`` was run
+    with ``normalize_mag_by_mu=True``), also includes mean_mu_{umb,pen,both}, and mean_mu_hotspot
+    when there is a hot spot — the mean heliocentric-angle cosine over each mask, useful for
+    judging how much of a region's field trend is just foreshortening.
     """
     cube_mag      = data['cube_mag']
     cube_dop      = data['cube_dop']
@@ -282,23 +295,36 @@ def compute_metrics(data: dict) -> dict:
     hot_spot      = data.get('hot_spot')
     n_qsun        = cube_mag_qsun.shape[0]
 
-    result = dict(
-        mean_mag_umb   = _mean_series(cube_mag, umbra),
-        mean_mag_pen   = _mean_series(cube_mag, penumbra),
-        mean_mag_both  = _mean_series(cube_mag, both),
-        mean_mag_quiet = np.array([np.nanmean(cube_mag_qsun[t], dtype=np.float64) for t in range(n_qsun)]),
-        mean_dop_umb   = _mean_series(cube_dop, umbra),
-        mean_dop_pen   = _mean_series(cube_dop, penumbra),
-        mean_dop_both  = _mean_series(cube_dop, both),
-        mean_dop_quiet = np.array([np.nanmean(cube_dop_qsun[t], dtype=np.float64) for t in range(n_qsun)]),
-        area_umb       = umbra.sum(axis=(1, 2)).astype(float),
-        area_pen       = penumbra.sum(axis=(1, 2)).astype(float),
-        area_both      = both.sum(axis=(1, 2)).astype(float),
-    )
+    mag_variant = '_absolute' if use_absolute_mag else ''
+    mag_src      = np.abs(cube_mag)      if use_absolute_mag else cube_mag
+    mag_qsun_src = np.abs(cube_mag_qsun) if use_absolute_mag else cube_mag_qsun
+
+    result = {
+        f'mean_mag_umb{mag_variant}'   : _mean_series(mag_src, umbra),
+        f'mean_mag_pen{mag_variant}'   : _mean_series(mag_src, penumbra),
+        f'mean_mag_both{mag_variant}'  : _mean_series(mag_src, both),
+        f'mean_mag_quiet{mag_variant}' : np.array([np.nanmean(mag_qsun_src[t], dtype=np.float64) for t in range(n_qsun)]),
+        'mean_dop_umb'  : _mean_series(cube_dop, umbra),
+        'mean_dop_pen'  : _mean_series(cube_dop, penumbra),
+        'mean_dop_both' : _mean_series(cube_dop, both),
+        'mean_dop_quiet': np.array([np.nanmean(cube_dop_qsun[t], dtype=np.float64) for t in range(n_qsun)]),
+        'area_umb'      : umbra.sum(axis=(1, 2)).astype(float),
+        'area_pen'      : penumbra.sum(axis=(1, 2)).astype(float),
+        'area_both'     : both.sum(axis=(1, 2)).astype(float),
+        'mag_variant'   : mag_variant,
+    }
 
     if hot_spot is not None:
-        result['mean_mag_hotspot'] = _mean_series(cube_mag, hot_spot)
-        result['area_hotspot']     = hot_spot.sum(axis=(1, 2)).astype(float)
+        result[f'mean_mag_hotspot{mag_variant}'] = _mean_series(mag_src, hot_spot)
+        result['area_hotspot']                   = hot_spot.sum(axis=(1, 2)).astype(float)
+
+    cube_mu = data.get('cube_mu')
+    if cube_mu is not None:
+        result['mean_mu_umb']  = _mean_series(cube_mu, umbra)
+        result['mean_mu_pen']  = _mean_series(cube_mu, penumbra)
+        result['mean_mu_both'] = _mean_series(cube_mu, both)
+        if hot_spot is not None:
+            result['mean_mu_hotspot'] = _mean_series(cube_mu, hot_spot)
 
     # A frame with no continuum has empty masks by construction, so its areas mean
     # "no data", not "no spot".
@@ -317,6 +343,7 @@ def save_metrics_csv(
     metrics: dict,
     processed_dir: str | pathlib.Path,
     raw_dopler: bool = False,
+    mag_variant: str | None = None,
 ) -> pathlib.Path:
     """
     Save the per-frame time-series metrics to a CSV file.
@@ -324,6 +351,11 @@ def save_metrics_csv(
     Columns: time_h, area_umb, area_pen, area_both,
              mean_mag_umb, mean_mag_pen, mean_mag_both, mean_mag_quiet,
              mean_dop_umb, mean_dop_pen, mean_dop_both, mean_dop_quiet
+    (the ``mean_mag_*`` columns carry ``mag_variant`` appended, e.g. ``mean_mag_umb_absolute``,
+    when ``metrics`` came from ``compute_metrics(..., use_absolute_mag=True)``.)
+    Also writes mean_mu_umb, mean_mu_pen, mean_mu_both (and mean_mu_hotspot when there is a
+    hot spot) when ``metrics`` has them, i.e. when the region was loaded with
+    ``normalize_mag_by_mu=True``.
 
     Parameters
     ----------
@@ -331,30 +363,43 @@ def save_metrics_csv(
     metrics       : dict from compute_metrics()
     processed_dir : directory where the CSV will be written
                     (created if it does not exist)
+    mag_variant   : which ``mean_mag_*`` family to write — ``''`` for the signed field,
+                    ``'_absolute'`` for ``|B|``. Defaults to ``metrics['mag_variant']``, i.e.
+                    whatever ``compute_metrics`` was actually run with.
 
     Returns
     -------
     Path to the saved CSV file.
     """
+    if mag_variant is None:
+        mag_variant = metrics.get('mag_variant', '')
+
     out_dir = pathlib.Path(processed_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / 'metrics.csv'
 
     cols = {
-        'time_h'        : data['time_h'],
-        'area_umb'      : metrics['area_umb'],
-        'area_pen'      : metrics['area_pen'],
-        'area_both'     : metrics['area_both'],
-        'mean_mag_umb'  : metrics['mean_mag_umb'],
-        'mean_mag_pen'  : metrics['mean_mag_pen'],
-        'mean_mag_both' : metrics['mean_mag_both'],
-        'mean_mag_quiet': metrics['mean_mag_quiet'],
-        'mean_dop_quiet': metrics['mean_dop_quiet'],
+        'time_h'                          : data['time_h'],
+        'area_umb'                        : metrics['area_umb'],
+        'area_pen'                        : metrics['area_pen'],
+        'area_both'                       : metrics['area_both'],
+        f'mean_mag_umb{mag_variant}'      : metrics[f'mean_mag_umb{mag_variant}'],
+        f'mean_mag_pen{mag_variant}'      : metrics[f'mean_mag_pen{mag_variant}'],
+        f'mean_mag_both{mag_variant}'     : metrics[f'mean_mag_both{mag_variant}'],
+        f'mean_mag_quiet{mag_variant}'    : metrics[f'mean_mag_quiet{mag_variant}'],
+        'mean_dop_quiet'                  : metrics['mean_dop_quiet'],
     }
     if 'area_hotspot' in metrics:
-        cols['area_hotspot']     = metrics['area_hotspot']
-        cols['mean_mag_hotspot'] = metrics['mean_mag_hotspot']
-    
+        cols['area_hotspot']                        = metrics['area_hotspot']
+        cols[f'mean_mag_hotspot{mag_variant}']       = metrics[f'mean_mag_hotspot{mag_variant}']
+
+    if 'mean_mu_umb' in metrics:
+        cols['mean_mu_umb']  = metrics['mean_mu_umb']
+        cols['mean_mu_pen']  = metrics['mean_mu_pen']
+        cols['mean_mu_both'] = metrics['mean_mu_both']
+        if 'mean_mu_hotspot' in metrics:
+            cols['mean_mu_hotspot'] = metrics['mean_mu_hotspot']
+
     if not raw_dopler:
         cols['mean_dop_umb']  = metrics['mean_dop_umb']
         cols['mean_dop_pen']  = metrics['mean_dop_pen']
@@ -427,6 +472,7 @@ def plot_time_series(
     mag_residual: bool = False,
     subtract_quiet: bool = False,
     do_not_show_quiet: bool = False,
+    mag_variant: str | None = None,
 ) -> None:
     """
     Plot mean B and Doppler velocity vs time for umbra, penumbra, both, and quiet sun.
@@ -439,7 +485,12 @@ def plot_time_series(
     save       : if True, save the figure to plots_dir
     plots_dir  : directory for saved figures (required when save=True)
     do_not_show_quiet : if True, do not show the quiet sun series
+    mag_variant : which ``mean_mag_*`` family to plot — ``''`` for the signed field,
+                  ``'_absolute'`` for ``|B|``. Defaults to ``metrics['mag_variant']``.
     """
+    if mag_variant is None:
+        mag_variant = metrics.get('mag_variant', '')
+
     time_h = data['time_h']
 
     def _norm(arr):
@@ -455,31 +506,27 @@ def plot_time_series(
 
     if not mag_residual:
         series = [
-            ('Umbra',     metrics['mean_mag_umb'],   metrics['mean_dop_umb'],   'red'),
-            ('Penumbra',  metrics['mean_mag_pen'],   metrics['mean_dop_pen'],   'blue'),
-            ('Both',      metrics['mean_mag_both'],  metrics['mean_dop_both'],  'purple'),
-            ('Quiet Sun', metrics['mean_mag_quiet'], metrics['mean_dop_quiet'], 'black'),
+            ('Umbra',     metrics[f'mean_mag_umb{mag_variant}'],   metrics['mean_dop_umb'],   'red'),
+            ('Penumbra',  metrics[f'mean_mag_pen{mag_variant}'],   metrics['mean_dop_pen'],   'blue'),
+            ('Both',      metrics[f'mean_mag_both{mag_variant}'],  metrics['mean_dop_both'],  'purple'),
         ]
+        if not do_not_show_quiet:
+            series.append(
+                ('Quiet Sun', metrics[f'mean_mag_quiet{mag_variant}'], metrics['mean_dop_quiet'], 'black')
+            )
     else:
-         if not do_not_show_quiet:
-            series = [
-                ('Umbra',     metrics['mean_mag_umb_residual'],   metrics['mean_dop_umb'],   'red'),
-                ('Penumbra',  metrics['mean_mag_pen_residual'],   metrics['mean_dop_pen'],   'blue'),
-                ('Both',      metrics['mean_mag_both_residual'],  metrics['mean_dop_both'],  'purple'),
-                ('Quiet Sun', None, metrics['mean_dop_quiet'], 'black'),
-            ]
-         else:
-            series = [
-                ('Umbra',     metrics['mean_mag_umb_residual'],   metrics['mean_dop_umb'],   'red'),
-                ('Penumbra',  metrics['mean_mag_pen_residual'],   metrics['mean_dop_pen'],   'blue'),
-                ('Both',      metrics['mean_mag_both_residual'],  metrics['mean_dop_both'],  'purple'),
-                ('Quiet Sun', None, None, 'black'),
-            ]
+        series = [
+            ('Umbra',     metrics[f'mean_mag_umb{mag_variant}_residual'],   metrics['mean_dop_umb'],   'red'),
+            ('Penumbra',  metrics[f'mean_mag_pen{mag_variant}_residual'],   metrics['mean_dop_pen'],   'blue'),
+            ('Both',      metrics[f'mean_mag_both{mag_variant}_residual'],  metrics['mean_dop_both'],  'purple'),
+        ]
+        if not do_not_show_quiet:
+            series.append(('Quiet Sun', None, metrics['mean_dop_quiet'], 'black'))
 
-    hotspot_mag = metrics.get('mean_mag_hotspot')
+    hotspot_mag = metrics.get(f'mean_mag_hotspot{mag_variant}')
 
     if subtract_quiet:
-        mag_quiet = metrics['mean_mag_quiet']
+        mag_quiet = metrics[f'mean_mag_quiet{mag_variant}']
         dop_quiet = metrics['mean_dop_quiet']
         series = [
             (name, mag - mag_quiet if mag is not None else None,
@@ -502,7 +549,7 @@ def plot_time_series(
     if hotspot_mag is not None:
         ax1.plot(time_h, proc(hotspot_mag), color='darkorange', lw=0.8, label='Hot spot')
 
-    ax1.set_ylabel(ylabel_mag); ax1.set_title('Mean magnetogram' + suffix.replace('_', ' '))
+    ax1.set_ylabel(ylabel_mag); ax1.set_title('Mean magnetogram' + suffix.replace('_', ' ') + mag_variant)
     ax1.grid(alpha=0.3); ax1.legend()
     ax2.set_ylabel(ylabel_dop); ax2.set_xlabel('Time  (h)')
     ax2.set_title('Mean dopplergram' + suffix.replace('_', ' '))

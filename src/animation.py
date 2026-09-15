@@ -29,6 +29,7 @@ def save_animation(
     dop_symmetric_cbar: bool = True,
     embed_frames: bool = False,
     panel_titles: Sequence[str] | None = None,
+    mag_variant: str | None = None,
 ) -> None:
     """
     Save a 3-channel (continuum / magnetogram / dopplergram) animation as HTML.
@@ -60,7 +61,13 @@ def save_animation(
                          the colorbar label is the last thing a projected figure is read
                          for. The units stay on the colorbar, so the title says what the
                          panel *is* and the colorbar what its colours mean.
+    mag_variant        : which ``mean_mag_*`` family to read for the on-frame ``<B>`` text —
+                         ``''`` for the signed field, ``'_absolute'`` for ``|B|``. Defaults
+                         to ``metrics['mag_variant']``.
     """
+    if mag_variant is None:
+        mag_variant = metrics.get('mag_variant', '')
+
     save_path = pathlib.Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     matplotlib.rcParams['animation.embed_limit'] = embed_limit_mb
@@ -72,8 +79,8 @@ def save_animation(
     penumbra     = data['penumbra']
     n_t          = data['n_t']
     cadence_s    = data['cadence_s']
-    mean_mag_umb = metrics['mean_mag_umb']
-    mean_mag_pen = metrics['mean_mag_pen']
+    mean_mag_umb = metrics[f'mean_mag_umb{mag_variant}']
+    mean_mag_pen = metrics[f'mean_mag_pen{mag_variant}']
 
     frames_idx = np.arange(0, n_t, step)
     cubes_ch   = [cube_cont,        cube_mag,           cube_dop]

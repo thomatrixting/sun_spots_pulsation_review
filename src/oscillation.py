@@ -35,6 +35,8 @@ def fit_diurnal(
     period_h: float = DIURNAL_PERIOD_H,
     mask: np.ndarray | None = None,
     label: str = '',
+    warn_short_window: bool = True,
+    trend_deg: int = 0,
 ) -> dict:
     """Fit ``c + a sin(2 pi t / P) + b cos(2 pi t / P)`` over a stretch of the series.
 
@@ -61,14 +63,35 @@ def fit_diurnal(
         directly comparable — see the note on the instrumental control below.
     label : str
         Used only in the warning messages, so a marginal fit can be traced to its region.
+    trend_deg : int
+        Degree of a polynomial trend fitted *jointly* with the sinusoid: 0 (default) is
+        the intercept alone and reproduces the model in the summary line above, 1 adds a
+        slope, 2 a curvature. The trend is in ``(t - window_start)``, so ``intercept``
+        keeps meaning the level at the start of the window whichever degree is used.
+
+        **Use 1 for a series carrying the spot's own drift.** As the spot rotates across
+        the disk its line-of-sight projection changes, so a mean Doppler series sits on a
+        slow ramp that has nothing to do with the oscillation. Fitting that ramp *with*
+        the sinusoid rather than subtracting it first is what keeps the two from
+        contaminating each other: over a window that is not a whole number of cycles, a
+        line fitted to data that still contains the sinusoid absorbs part of it, and the
+        amplitude comes out low. See `sine_amplitude`, which pre-detrends when
+        ``trend_deg=0`` and hands the job to this fit when it is 1 or more.
+    warn_short_window : bool
+        Whether to warn when the window is under 1.5 periods. Set False only where the
+        window length is the deliberate design — `windowed_amplitudes` fits one period per
+        window by construction and would otherwise emit the same warning a hundred times.
+        The caveat does not go away with the warning: read `sigma_amplitude`.
 
     Returns
     -------
     dict
         ``intercept``, ``amplitude``, ``phase_rad``, ``t_max`` (hours after the window
         start at which the fitted curve peaks), the matching ``sigma_intercept`` /
-        ``sigma_amplitude``, ``n`` points used, ``rms_residual``, ``period_h`` and
-        ``window``. Every numeric field is NaN when there was too little data, rather than
+        ``sigma_amplitude``, ``n`` points used, ``rms_residual``, ``period_h``,
+        ``window``, ``trend_deg`` and ``trend`` (the fitted trend coefficients, lowest
+        order first, empty when ``trend_deg`` is 0; ``trend[0]`` is the slope in units
+        per hour). Every numeric field is NaN when there was too little data, rather than
         raising, so one thin window cannot abort a loop over regions.
 
     Notes
@@ -96,19 +119,22 @@ def fit_diurnal(
     if mask is not None:
         inside &= np.asarray(mask, dtype=bool)
     n = int(inside.sum())
-    # Three free parameters, so four points is the minimum that leaves anything to check
-    # the fit against. `n` is reported even when the fit is refused, so the table says how
-    # close the window came rather than a bare zero.
-    if n < 4:
+    # Intercept, sin and cos, plus one column per trend degree; one more point than that
+    # is the minimum that leaves anything to check the fit against. `n` is reported even
+    # when the fit is refused, so the table says how close the window came rather than a
+    # bare zero.
+    n_params = 3 + int(trend_deg)
+    if n < n_params + 1:
         warnings.warn(f'fit_diurnal{f" [{label}]" if label else ""}: only {n} finite '
                       f'point(s) in {window[0]:g}-{window[1]:g} h — no fit', stacklevel=2)
         return dict(intercept=np.nan, amplitude=np.nan, phase_rad=np.nan, t_max=np.nan,
                     sigma_intercept=np.nan, sigma_amplitude=np.nan, n=n,
                     rms_residual=np.nan, period_h=period_h, window=window,
-                    coefficients=np.full(3, np.nan))
+                    coefficients=np.full(n_params, np.nan),
+                    trend_deg=int(trend_deg), trend=np.full(int(trend_deg), np.nan))
 
     span = window[1] - window[0]
-    if span < 1.5 * period_h:
+    if warn_short_window and span < 1.5 * period_h:
         warnings.warn(
             f'fit_diurnal{f" [{label}]" if label else ""}: the {span:g} h window is only '
             f'{span / period_h:.2f} periods long. Amplitude, phase and intercept are '
@@ -117,16 +143,22 @@ def fit_diurnal(
 
     t, y = time_h[inside], series[inside]
     omega = 2 * np.pi / period_h
-    design = np.column_stack([np.ones(n), np.sin(omega * t), np.cos(omega * t)])
+    # Trend columns come last so `coefficients[:3]` is still (c, a, b) whatever the
+    # degree, and they are powers of the time *since the window start* rather than of
+    # `t` itself: a 200 h offset raised to a power is what makes the normal equations
+    # ill-conditioned, and it would also stop `intercept` meaning the starting level.
+    columns = [np.ones(n), np.sin(omega * t), np.cos(omega * t)]
+    columns += [(t - window[0]) ** k for k in range(1, int(trend_deg) + 1)]
+    design = np.column_stack(columns)
 
     coef, *_ = np.linalg.lstsq(design, y, rcond=None)
-    c, a, b = coef
+    c, a, b = coef[:3]
     residual = y - design @ coef
     amplitude = float(np.hypot(a, b))
 
     # Parameter covariance the textbook way: residual variance times inv(X'X). With only
     # as many points as parameters there is no residual left to estimate it from.
-    dof = n - 3
+    dof = n - n_params
     if dof > 0:
         var = float(residual @ residual) / dof
         cov = var * np.linalg.pinv(design.T @ design)
@@ -148,35 +180,53 @@ def fit_diurnal(
         sigma_intercept=sigma_c, sigma_amplitude=sigma_amp, n=n,
         rms_residual=float(np.sqrt(np.mean(residual ** 2))),
         period_h=period_h, window=window, coefficients=coef,
+        trend_deg=int(trend_deg), trend=coef[3:],
     )
 
 
 def diurnal_curve(fit: dict, time_h: np.ndarray) -> np.ndarray:
     """Evaluate a `fit_diurnal` result at arbitrary times, for plotting over the data."""
-    c, a, b = fit['coefficients']
+    c, a, b = fit['coefficients'][:3]
     omega = 2 * np.pi / fit['period_h']
     t = np.asarray(time_h, dtype=float)
-    return c + a * np.sin(omega * t) + b * np.cos(omega * t)
+    curve = c + a * np.sin(omega * t) + b * np.cos(omega * t)
+    # Fits made before `trend_deg` existed have neither key; they are pure sinusoids.
+    for k, coefficient in enumerate(fit.get('trend', ()), start=1):
+        curve = curve + coefficient * (t - fit['window'][0]) ** k
+    return curve
 
 
 # ── amplitude estimators ─────────────────────────────────────────────────────
 # Three ways to answer "how big is the oscillation", kept side by side because they
 # disagree in informative ways and 04 compares them directly.
 
-def sine_amplitude(time_h, series, period_h, label='', detrend_deg=1):
+def sine_amplitude(time_h, series, period_h, label='', detrend_deg=1, trend_deg=0):
     """`fit_diurnal` on the same prepared series the spectrum sees.
 
     Returns the full fit dict: `amplitude` is the semi-amplitude A of
     `A sin(2.pi.t/P + phi)` and `sigma_amplitude` its uncertainty — with only ~2 cycles in
     the window that sigma is what says whether the amplitude can be read at all.
+
+    The slow drift a rotating spot puts on a mean Doppler series can be taken out two
+    ways, and `trend_deg` chooses between them. At 0 (the default, and what every number
+    written before this existed used) `detrend_deg` subtracts a line *first* and the fit
+    sees the residual. At 1 or more the pre-detrend is skipped and the trend is fitted
+    together with the sinusoid, which is the better-conditioned of the two: over a window
+    that is not a whole number of cycles a line fitted to data that still contains the
+    sinusoid absorbs part of it, and the amplitude comes out low.
     """
     from .spectra import resample_uniform
 
-    t, y = resample_uniform(time_h, series, detrend_deg=detrend_deg)
+    # Fitting the trend and pre-removing it would take it out twice — harmlessly for the
+    # amplitude, but `intercept` and `trend` would then describe the residual rather than
+    # the series, which is exactly what someone reading a drift rate off them wants.
+    prepare_deg = None if trend_deg else detrend_deg
+    t, y = resample_uniform(time_h, series, detrend_deg=prepare_deg)
     if t.size < 8 or not np.isfinite(period_h):
         return dict(amplitude=np.nan, sigma_amplitude=np.nan, rms_residual=np.nan,
-                    period_h=period_h, coefficients=np.full(3, np.nan))
-    return fit_diurnal(t, y, period_h=float(period_h), label=label)
+                    period_h=period_h, coefficients=np.full(3 + trend_deg, np.nan),
+                    trend_deg=trend_deg, trend=np.full(trend_deg, np.nan))
+    return fit_diurnal(t, y, period_h=float(period_h), label=label, trend_deg=trend_deg)
 
 
 def peak_to_peak_amplitude(time_h, series, detrend_deg=2):
@@ -193,16 +243,30 @@ def peak_to_peak_amplitude(time_h, series, detrend_deg=2):
     return float(finite.max() - finite.min()) / 2
 
 
-def amplitude_summary(time_h, series, band_h=(16.0, 36.0), period_h=None, label=''):
+def amplitude_summary(time_h, series, band_h=(16.0, 36.0), period_h=None, label='',
+                      trend_deg=0):
     """All three estimators for one series, as one dict.
 
     `period_h` fixes the sinusoidal fit's period; None takes the period the band-limited
     spectrum found, which is the honest default when the period is not known a priori.
+
+    `trend_deg` goes to `sine_amplitude`: 1 fits the rotational drift jointly with the
+    sinusoid instead of subtracting a line beforehand, and reports it as `fit_slope`.
+    The key set never changes — at the default 0, `fit_slope` is NaN rather than missing —
+    so a caller stacking these into a DataFrame gets the same columns either way. Only
+    the `fit_*` values change: the FFT and peak-to-peak estimators do their own detrending
+    and are left alone, which is what keeps the three comparable.
     """
     spectral = band_amplitude(time_h, series, band_h=band_h)
     fit_period = period_h if period_h is not None else spectral['period_h']
-    fit = sine_amplitude(time_h, series, fit_period, label=label)
+    fit = sine_amplitude(time_h, series, fit_period, label=label, trend_deg=trend_deg)
+    trend = np.asarray(fit.get('trend', ()), dtype=float)
+    # Always present, NaN when no trend was fitted. Making a key's *existence* depend on an
+    # argument is what turns "you forgot trend_deg" into a KeyError three lines later
+    # instead of a NaN you can see in the table.
     return {
+        'fit_slope': float(trend[0]) if trend.size else np.nan,
+        'fit_trend_deg': int(trend_deg),
         'fft_amplitude': spectral['amplitude'],
         'fft_period_h': spectral['period_h'],
         'n_cycles': spectral['n_cycles'],
@@ -211,6 +275,68 @@ def amplitude_summary(time_h, series, band_h=(16.0, 36.0), period_h=None, label=
         'fit_period_h': fit_period,
         'peak_to_peak': peak_to_peak_amplitude(time_h, series),
     }
+
+
+def windowed_amplitudes(time_h, series, window_h=DIURNAL_PERIOD_H,
+                        period_h=DIURNAL_PERIOD_H, min_fraction=0.5, label=''):
+    """Amplitude per consecutive `window_h` window, rather than one number per series.
+
+    One row per window buys two things a whole-series amplitude cannot give. It says whether
+    the oscillation is steady or comes and goes — a single fit over 200 h reports the average
+    of both cases and cannot tell them apart — and it pairs each amplitude with the spot as it
+    was *during that window*, so an amplitude can be set against an area or a field strength
+    measured at the same time instead of against a 200 h mean taken while the spot crossed
+    half the disk.
+
+    **One window is one cycle.** At the default 24 h window and 24 h period the sinusoid
+    completes exactly one turn, and amplitude, phase and offset are only weakly separated —
+    the reason `fit_diurnal` normally warns here, and the reason `sigma_amplitude` comes back
+    with every row. `minmax_amplitude` is returned alongside precisely because it fails
+    differently: it needs no period at all, but a single outlier moves it.
+
+    Parameters
+    ----------
+    window_h : length of each window, in hours. Windows are consecutive and do not overlap,
+        starting at the first finite sample.
+    period_h : the period fitted inside each window.
+    min_fraction : drop a trailing window that covers less than this much of `window_h`.
+        The last stretch of a series is rarely a whole window, and a fit over a few hours of
+        a 24 h sinusoid is not an amplitude.
+
+    Returns
+    -------
+    list of dict — `t_start`, `t_end`, `n`, `amplitude`, `sigma_amplitude`,
+    `minmax_amplitude`. Windows with too few finite points are skipped.
+    """
+    time_h = np.asarray(time_h, dtype=float)
+    series = np.asarray(series, dtype=float)
+    finite = np.isfinite(time_h) & np.isfinite(series)
+    if finite.sum() < 4:
+        return []
+
+    start, stop = float(time_h[finite].min()), float(time_h[finite].max())
+    rows = []
+    for edge in np.arange(start, stop, window_h):
+        window = (edge, edge + window_h)
+        if (min(window[1], stop) - window[0]) < min_fraction * window_h:
+            continue
+
+        inside = finite & (time_h >= window[0]) & (time_h <= window[1])
+        if inside.sum() < 4:
+            continue
+
+        fit = fit_diurnal(time_h, series, window=window, period_h=period_h,
+                          label=f'{label} {window[0]:.0f}-{window[1]:.0f} h',
+                          warn_short_window=False)
+        rows.append({
+            't_start': window[0],
+            't_end': window[1],
+            'n': int(inside.sum()),
+            'amplitude': fit['amplitude'],
+            'sigma_amplitude': fit['sigma_amplitude'],
+            'minmax_amplitude': peak_to_peak_amplitude(time_h[inside], series[inside]),
+        })
+    return rows
 
 
 # ── detrending views ─────────────────────────────────────────────────────────
@@ -237,9 +363,11 @@ def plot_moving_average(data, metrics, window_min=1422, key='mean_dop',
         series = metrics.get(f'{key}_{suffix}')
         if series is None:
             continue
-        smoothed, window = moving_average(series, cadence_s, window_min)
+        grid_h, smoothed, window = moving_average(series, cadence_s, window_min,
+                                                  time_h=time_h)
         overall[label] = float(np.nanmean(smoothed))
-        ax.plot(time_h, smoothed, color=colours.get(suffix, 'grey'), lw=1.2, label=label)
+        axis_h = grid_h if grid_h is not None else time_h
+        ax.plot(axis_h, smoothed, color=colours.get(suffix, 'grey'), lw=1.2, label=label)
 
     ax.set_xlabel('Time (h)')
     ax.set_ylabel(f'Mean velocity, {window_min:.0f} min window  (m/s)')
@@ -279,9 +407,11 @@ def plot_filtered(data, metrics, period_min=1442, key='mean_dop', width_mhz=0.00
         series = metrics.get(f'{key}_{suffix}')
         if series is None:
             continue
-        filtered, n_bins = notch_filter(series, cadence_s, period_min, width_mhz=width_mhz)
+        grid_h, filtered, n_bins = notch_filter(series, cadence_s, period_min,
+                                                width_mhz=width_mhz, time_h=time_h)
         filtered_by_region[label] = filtered
-        ax.plot(time_h[:len(filtered)], filtered, color=colours.get(suffix, 'grey'),
+        axis_h = grid_h if grid_h is not None else time_h
+        ax.plot(axis_h[:len(filtered)], filtered, color=colours.get(suffix, 'grey'),
                 lw=0.9, label=label)
 
     ax.set_xlabel('Time (h)')

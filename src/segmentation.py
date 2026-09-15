@@ -190,10 +190,12 @@ def masks_from_cubes(
     umbra_thresh: float = 30_000,
     penumbra_thresh: float = 50_000,
     cluster_mode: str = 'largest',
-    cadence_s: float = 720.0,
+    cadence_s: float | np.ndarray = 720.0,
     filter_mask: bool = True,
     filter_both: bool = False,
     mag_filter: Callable[[np.ndarray], np.ndarray] | None = None,
+    cluster_xlim: tuple[int, int] | None = None,
+    cluster_ylim: tuple[int, int] | None = None,
 ) -> dict:
     """
     Build region masks and the ``load_ds0n_region``-style data dict from
@@ -203,6 +205,22 @@ def masks_from_cubes(
     pipeline) rather than the on-disk ones.
 
     Parameters mirror ``load_ds0n_region`` — see its docstring for details.
+
+    cadence_s : float or ndarray
+        A scalar assumes a uniform grid, ``time_h = arange(n_t) * cadence_s``. An array of
+        the ``n_t - 1`` measured gaps (what ``loaders.verify_cadence`` returns second)
+        builds ``time_h`` by cumsum instead, so a dataset whose cadence jumps gets a real
+        elapsed-time axis. ``data['cadence_s']`` is the median either way, because every
+        spectral estimator downstream takes a single number.
+
+    cluster_xlim, cluster_ylim : (int, int) or None
+        Restrict where ``_keep_central_cluster`` looks for a spot, as pixel index ranges
+        ``(min, max)`` on the frame's x (columns) / y (rows) axes. A region can contain more
+        than one sunspot, and without this the cluster search runs over the whole frame and
+        may lock onto the wrong one. Only pixels outside the given range(s) are excluded from
+        the *search* — the raw threshold masks (``umbra``/``penumbra`` when ``filter_mask`` is
+        False) are unaffected. ``None`` (either or both) keeps the whole frame, i.e. today's
+        behaviour.
     """
     n_t = cube_cont.shape[0]
 
@@ -218,8 +236,22 @@ def masks_from_cubes(
     penumbra_raw = (cube_cont < penumbra_thresh) & np.isfinite(cube_cont) & ~umbra_raw
 
     if filter_mask:
-        umbra    = np.array([_keep_central_cluster(umbra_raw[t],    cluster_mode) for t in range(n_t)], dtype=bool)
-        penumbra = np.array([_keep_central_cluster(penumbra_raw[t], cluster_mode) for t in range(n_t)], dtype=bool)
+        if cluster_xlim is not None or cluster_ylim is not None:
+            search_region = np.ones(cube_cont.shape[1:], dtype=bool)
+            if cluster_xlim is not None:
+                xmin, xmax = cluster_xlim
+                search_region[:, :xmin] = False
+                search_region[:, xmax:] = False
+            if cluster_ylim is not None:
+                ymin, ymax = cluster_ylim
+                search_region[:ymin, :] = False
+                search_region[ymax:, :] = False
+            umbra_search    = umbra_raw & search_region
+            penumbra_search = penumbra_raw & search_region
+        else:
+            umbra_search, penumbra_search = umbra_raw, penumbra_raw
+        umbra    = np.array([_keep_central_cluster(umbra_search[t],    cluster_mode) for t in range(n_t)], dtype=bool)
+        penumbra = np.array([_keep_central_cluster(penumbra_search[t], cluster_mode) for t in range(n_t)], dtype=bool)
         del umbra_raw, penumbra_raw
     else:
         umbra = umbra_raw

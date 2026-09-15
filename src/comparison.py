@@ -200,6 +200,57 @@ def plot_amplitude_vs_area(rows, fit_key='fit_rel', fit_var='amplitude', inverse
     plt.close(fig)
 
 
+def plot_amplitude_vs_predictors(frame, x_keys, y_key, yerr_key=None, ax=None,
+                                 annotate_key=None, xlabel='', ylabel='amplitude (m/s)',
+                                 title='', save=False, plots_dir=None, filename=None):
+    """One amplitude against several candidate predictors, drawn on a single axis.
+
+    The predictors share an axis on purpose: `area_umb` and `area_both` are both areas in
+    pixels, `mean_mag_umb` and `mean_mag_hotspot` both fields in gauss, so putting them side
+    by side is what lets the two be compared rather than merely both plotted. Pearson r and
+    the number of points behind it go in the legend per series — with a dozen points r
+    describes the sample and nothing more, which is why n is never hidden.
+
+    `ax=None` makes its own figure; pass an axis to compose a row of panels.
+    """
+    own_figure = ax is None
+    if own_figure:
+        _, ax = plt.subplots(figsize=(7, 5))
+
+    markers = ('o', 's', '^', 'D')
+    y = frame[y_key].to_numpy(dtype=float)
+    yerr = (frame[yerr_key].to_numpy(dtype=float)
+            if yerr_key is not None and yerr_key in frame.columns else None)
+
+    for (key, marker) in zip(x_keys, markers):
+        x = frame[key].to_numpy(dtype=float)
+        ok = np.isfinite(x) & np.isfinite(y)
+        label = key
+        if ok.sum() > 2:
+            r = float(np.corrcoef(x[ok], y[ok])[0, 1])
+            label = f'{key}   r = {r:+.2f} (n = {int(ok.sum())})'
+        ax.errorbar(x, y, yerr=yerr, fmt=marker, ms=6, lw=0, capsize=3, elinewidth=1,
+                    alpha=0.85, label=label)
+
+        if annotate_key is not None:
+            for name, xi, yi in zip(frame[annotate_key], x, y):
+                ax.annotate(str(name), (xi, yi), textcoords='offset points', xytext=(6, 3),
+                            fontsize=7, color='0.45')
+
+    ax.set_xlabel(xlabel or ' / '.join(x_keys))
+    ax.set_ylabel(ylabel)
+    ax.set_title(title or y_key)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=7)
+
+    if own_figure:
+        plt.tight_layout()
+        save_figure(ax.figure, plots_dir, filename or f'{y_key}_vs_predictors.png', save)
+        plt.show()
+        plt.close(ax.figure)
+    return ax
+
+
 def correlation_heatmap(frame, title='Correlations', save=False, plots_dir=None,
                         filename='correlation_heatmap.png'):
     """Pearson correlation matrix of a DataFrame's numeric columns.

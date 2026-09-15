@@ -113,8 +113,9 @@ DS9 8.3 is useful for looking at the cubes directly; `03A` exports a mask cube f
 ## Known data problems
 
 - `DS10`'s `cube_continuum.fits` is truncated (astropy: *buffer is too small for requested
-  array*) and `DS11` has no continuum cube. Both are listed in `config.DS0N_BROKEN`; line B
-  currently covers `DS00`–`DS09`.
+  array*) and `DS11` has no continuum cube. Neither is excluded anywhere: line B lists every
+  `DS<number>` directory found in `data/raw/sebastian_sun_spots/`, so a broken delivery is
+  listed like any other and fails in the step 1 that loads it.
 - NOAA 11117 was downloaded with a magnetogram box (402×402) different from its other two
   series (433×433), and its box shrinks partway through the window. `02A` trims all three to
   their common data window as a repair — the real fix is to re-download it with one box.

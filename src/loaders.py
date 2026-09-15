@@ -69,12 +69,20 @@ def verify_cadence(
 
     Returns
     -------
-    Measured median cadence in seconds.
+    (median_s, gaps_s)
+        ``median_s`` is the measured median cadence in seconds, and ``gaps_s`` the full
+        array of ``n_t - 1`` measured gaps between consecutive frames. **Pass ``gaps_s``
+        straight into ``load_ds0n_region(cadence_s=...)``** when a dataset has jumps: that
+        is what makes ``time_h`` the real elapsed time (built by cumsum) instead of an
+        assumed uniform grid.
 
     Raises
     ------
-    ValueError  if any gap deviates from expected_s by more than tol_s.
     FileNotFoundError if the .sav file is absent.
+
+    A gap deviating from ``expected_s`` by more than ``tol_s`` only warns — the timing is
+    reported, never rejected, because an irregular cadence is a thing to feed forward, not
+    a thing to refuse.
     """
     ds_dir = pathlib.Path(ds_dir)
     sav_path = ds_dir / 'cube_continuum_coords2times.sav'
@@ -87,6 +95,18 @@ def verify_cadence(
     diffs = np.array([
         (times[i + 1] - times[i]).total_seconds() for i in range(len(times) - 1)
     ])
+
+    # A gap that is not positive means the timing file is out of order, which is a different
+    # complaint from "the cadence varies": cumsum still gives the right *total* elapsed time,
+    # but one frame sits in the past and any interpolation over that axis is meaningless
+    # until it is dealt with. DS00 and DS05 each carry one such frame.
+    backwards = np.flatnonzero(diffs <= 0)
+    if backwards.size:
+        warnings.warn(
+            f'{ds_dir.name}: {backwards.size} timestamp(s) out of order — frame(s) '
+            f'{(backwards + 1).tolist()[:5]} are dated before the frame preceding them '
+            f'(most negative gap {diffs.min() / 3600:.1f} h). time_h will not be monotonic.'
+        )
 
     bad = np.abs(diffs - expected_s) > tol_s
     if bad.any():
@@ -103,17 +123,83 @@ def verify_cadence(
     return median_cad , diffs
 
 
+def _frames_out_of_order(gaps_s: np.ndarray) -> np.ndarray:
+    """Indices of frames whose timestamp is inconsistent with both of its neighbours'.
+
+    Built from the per-gap cadences `verify_cadence` returns. An inversion between two
+    adjacent frames does not by itself say which of the two is wrong, so the test is which
+    one has to go for the order to come back: frame k is the culprit when it sits outside
+    its neighbours *and* those neighbours agree with each other once it is gone. That
+    catches a frame dated in the past (a dip — DS00's frame 837 and DS05's frame 362) and
+    one dated in the future (a spike) alike, and blames only the frame responsible.
+    """
+    times = np.concatenate([[0.0], np.cumsum(np.asarray(gaps_s, dtype=float))])
+    before = np.r_[-np.inf, times[:-1]]
+    after = np.r_[times[1:], np.inf]
+    return np.flatnonzero(((times <= before) | (times >= after)) & (before < after))
+
+
+def _drop_frames(cubes: dict, gaps_s: np.ndarray, drop: np.ndarray):
+    """Remove `drop` frames from every cube and re-measure the gaps across the holes."""
+    times = np.concatenate([[0.0], np.cumsum(np.asarray(gaps_s, dtype=float))])
+    keep = np.setdiff1d(np.arange(times.size), drop)
+    return ({name: cube[keep] for name, cube in cubes.items()},
+            np.diff(times[keep]))
+
+
+def _elapsed_s(gaps_s, n_t: int) -> np.ndarray:
+    """Elapsed seconds per frame, from either a scalar cadence or the measured gaps."""
+    gaps = np.asarray(gaps_s, dtype=float)
+    if gaps.ndim == 0:
+        return np.arange(n_t) * float(gaps)
+    return np.concatenate([[0.0], np.cumsum(gaps)])
+
+
+def _crop_to_time_limit(cubes: dict, gaps_s, time_limit):
+    """Keep only the frames inside `time_limit` hours, and re-measure the gaps.
+
+    Returns `(cubes, gaps_s, t0_h, kept)`. `t0_h` is the elapsed time of the first frame
+    kept, which the caller adds back to `time_h` so the axis keeps counting from the first
+    frame of the *whole* cube: cropping to (100, 350) gives a series labelled 100-350 h,
+    not 0-250 h, so a period or a window means the same thing cropped or not.
+    """
+    tmin, tmax = time_limit
+    n_t = len(next(iter(cubes.values())))
+    times_s = _elapsed_s(gaps_s, n_t)
+    times_h = times_s / 3600
+
+    keep = np.ones(n_t, dtype=bool)
+    if tmin is not None:
+        keep &= times_h >= tmin
+    if tmax is not None:
+        keep &= times_h <= tmax
+
+    kept = np.flatnonzero(keep)
+    if kept.size < 2:
+        raise ValueError(
+            f'time_limit={time_limit} h keeps {kept.size} frame(s); this cube covers '
+            f'{times_h[0]:.2f}-{times_h[-1]:.2f} h.')
+
+    return ({name: cube[kept] for name, cube in cubes.items()},
+            np.diff(times_s[kept]), float(times_h[kept[0]]), kept)
+
+
 def load_ds0n_region(
     ds_dir: str | pathlib.Path,
     umbra_thresh: float = 30_000,
     penumbra_thresh: float = 50_000,
     fill: float = 1e6,
     cluster_mode: str = 'largest',
-    cadence_s: float = 720.0,
+    cadence_s: float | np.ndarray = 720.0,
     filter_mask: bool = True,
     filter_both: bool = False,
     mag_filter: Callable[[np.ndarray], np.ndarray] | None = None,
     raw_dopler: bool = False,
+    cluster_xlim: tuple[int, int] | None = None,
+    cluster_ylim: tuple[int, int] | None = None,
+    normalize_mag_by_mu: bool = True,
+    drop_out_of_order: bool = False,
+    time_limit: tuple[float | None, float | None] | None = None,
 ) -> dict:
     """
     Load the SDO/HMI data cubes and build region masks.
@@ -149,6 +235,38 @@ def load_ds0n_region(
                       Example: ``lambda b: b > 500`` creates a region where
                       B > 500 G inside the sunspot.  The resulting mask is stored
                       as ``data['hot_spot']``.  If None, hot_spot is None.
+    cluster_xlim, cluster_ylim : (int, int) or None
+                      Restrict where the cluster search (`filter_mask=True`) looks for a
+                      spot, as pixel index ranges on x (columns) / y (rows). Use this when
+                      the box contains more than one sunspot and the wrong one gets picked.
+                      See `segmentation.masks_from_cubes` for exactly what it restricts.
+    drop_out_of_order : bool
+                      Drop frames whose timestamp is out of order — dated before the frame
+                      preceding them, or after the one following them. DS00 (frame 837) and
+                      DS05 (frame 362) each carry exactly one, ~190 h and ~73 h in the past,
+                      and `time_h` is not monotonic while they are in. Off by default: the
+                      timing file is reported as it is, and `verify_cadence` warns. Needs
+                      `cadence_s` to be the measured gap array — a scalar cadence carries no
+                      timestamps to judge. The frames removed are listed in
+                      `data['dropped_frames']`.
+    normalize_mag_by_mu : bool
+                      Divide `cube_mag` by this region's `cube_mu.fits` right after loading,
+                      before masks (and therefore `hot_spot`) are built — so `mag_filter`'s
+                      threshold applies to the mu-normalized field, not the raw one. Default
+                      True. `cube_mu.fits` ships alongside every DS0N dataset already, same
+                      grid as `cube_magnetogram.fits`.
+    time_limit      : (tmin, tmax) in HOURS from the first frame, or None for the whole
+                      cube. Every cube is cropped to that stretch before the masks are
+                      built, so everything downstream — metrics, spectra, the animation —
+                      sees only those frames. `(0, 350)` keeps the start of the series up to
+                      hour 350; either bound may be None to leave that end alone, e.g.
+                      `(350, None)`. Both ends are inclusive.
+
+                      `time_h` still counts from the first frame of the *whole* cube, so a
+                      crop of `(100, 350)` is labelled 100-350 h. The cut is by time, not by
+                      frame index, which is what makes it mean the same thing on a dataset
+                      whose cadence jumps. Applied after `drop_out_of_order`, so a frame with
+                      a bad timestamp cannot drag the window with it.
 
     Returns
     -------
@@ -167,18 +285,81 @@ def load_ds0n_region(
     cube_dop_qsun = _load_cube(ds_dir / 'cube_dopplergram_qsun.fits', fill)
     cube_mag_qsun = _load_cube(ds_dir / 'cube_magnetogram_qsun.fits', fill)
 
+    if normalize_mag_by_mu:
+        cube_mu = _load_cube(ds_dir / 'cube_mu.fits', fill)
+        cube_mag = cube_mag / cube_mu
 
     if not raw_dopler:
         cube_dop      = _load_cube(ds_dir / 'cube_dopplergram_corrected.fits', fill)
     else:
         cube_dop      = _load_cube(ds_dir / 'cube_dopplergram.fits', fill)
 
-    return masks_from_cubes(
+    dropped = np.array([], dtype=int)
+    if drop_out_of_order:
+        if np.asarray(cadence_s).ndim == 0:
+            warnings.warn('drop_out_of_order needs the measured gap array from '
+                          'verify_cadence as cadence_s; a scalar cadence has no timestamps '
+                          'to check. Nothing dropped.')
+        else:
+            dropped = _frames_out_of_order(cadence_s)
+            if dropped.size:
+                cubes = dict(cube_cont=cube_cont, cube_mag=cube_mag, cube_dop=cube_dop,
+                             cube_dop_qsun=cube_dop_qsun, cube_mag_qsun=cube_mag_qsun)
+                if normalize_mag_by_mu:
+                    # It goes out in `result` and gets averaged per mask in compute_metrics,
+                    # so it has to lose the same frames as everything else.
+                    cubes['cube_mu'] = cube_mu
+                cubes, cadence_s = _drop_frames(cubes, cadence_s, dropped)
+                cube_cont, cube_mag, cube_dop = (cubes['cube_cont'], cubes['cube_mag'],
+                                                 cubes['cube_dop'])
+                cube_dop_qsun, cube_mag_qsun = cubes['cube_dop_qsun'], cubes['cube_mag_qsun']
+                if normalize_mag_by_mu:
+                    cube_mu = cubes['cube_mu']
+                print(f'Dropped {dropped.size} out-of-order frame(s): {dropped.tolist()}')
+                # One pass fixes an isolated bad frame, which is what these files carry. Two
+                # adjacent ones would need another, so say so rather than hand back an axis
+                # that still runs backwards somewhere.
+                if np.any(cadence_s <= 0):
+                    warnings.warn('time_h is still not monotonic after dropping — there are '
+                                  'adjacent out-of-order frames. Inspect the .sav timing.')
+
+    # Crop before the masks are built, not after: everything downstream — the cluster
+    # search, the metrics, the spectra, the animation — then sees exactly the stretch asked
+    # for, and none of it needs to know a crop happened.
+    t0_h = 0.0
+    if time_limit is not None:
+        kept_from = cube_cont.shape[0]
+        cubes = dict(cube_cont=cube_cont, cube_mag=cube_mag, cube_dop=cube_dop,
+                     cube_dop_qsun=cube_dop_qsun, cube_mag_qsun=cube_mag_qsun)
+        if normalize_mag_by_mu:
+            cubes['cube_mu'] = cube_mu
+        cubes, cadence_s, t0_h, kept = _crop_to_time_limit(cubes, cadence_s, time_limit)
+        cube_cont, cube_mag, cube_dop = (cubes['cube_cont'], cubes['cube_mag'],
+                                         cubes['cube_dop'])
+        cube_dop_qsun, cube_mag_qsun = cubes['cube_dop_qsun'], cubes['cube_mag_qsun']
+        if normalize_mag_by_mu:
+            cube_mu = cubes['cube_mu']
+        print(f'time_limit {time_limit} h -> kept {kept.size} of {kept_from} frames, '
+              f'{t0_h:.2f}-{t0_h + np.sum(cadence_s) / 3600:.2f} h')
+
+    result = masks_from_cubes(
         cube_cont, cube_mag, cube_dop, cube_dop_qsun, cube_mag_qsun,
         umbra_thresh=umbra_thresh, penumbra_thresh=penumbra_thresh,
         cluster_mode=cluster_mode, cadence_s=cadence_s,
         filter_mask=filter_mask, filter_both=filter_both, mag_filter=mag_filter,
+        cluster_xlim=cluster_xlim, cluster_ylim=cluster_ylim,
     )
+    # masks_from_cubes counts time from the first frame it was handed, which after a crop is
+    # not the first frame of the cube. Put the offset back so `time_h` means the same thing
+    # cropped or not — see `time_limit` above.
+    result['time_h'] = result['time_h'] + t0_h
+    result['time_limit'] = time_limit
+    # Only loaded (and only meaningful) when normalize_mag_by_mu already read this cube once
+    # to build cube_mag above — kept here so compute_metrics can average it per mask without
+    # re-reading cube_mu.fits from disk a second time.
+    result['cube_mu'] = cube_mu if normalize_mag_by_mu else None
+    result['dropped_frames'] = dropped
+    return result
 
 
 def _fill_nearest_frames(cube: np.ndarray, present: np.ndarray, max_slots: int):
