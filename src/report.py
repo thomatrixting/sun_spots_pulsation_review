@@ -175,7 +175,7 @@ def _peak_table_html(rows: list[dict]) -> str:
             </table>"""
 
 
-def _region_section_html(region_dir: pathlib.Path) -> str:
+def _region_section_html(region_dir: pathlib.Path, spot_dirs: list[pathlib.Path]) -> str:
     name = html.escape(region_dir.name)
     parts = [f'        <div class="section region">\n'
              f'            <h2>Region {name} — all spots</h2>',
@@ -206,6 +206,18 @@ def _region_section_html(region_dir: pathlib.Path) -> str:
                      f'                <thead><tr>{head}</tr></thead>\n'
                      '                <tbody>\n' + '\n'.join(rows) + '\n'
                      '                </tbody>\n            </table>')
+    # Per-spot sections collapsed behind one toggle, each spot behind its own: the page
+    # opens on the region view, and a single spot is one click away without loading the
+    # others (their iframes are lazy, so a closed toggle costs nothing).
+    if spot_dirs:
+        parts.append(f'            <details class="spots">\n'
+                     f'                <summary>Spots of {name} ({len(spot_dirs)})</summary>')
+        for d in spot_dirs:
+            parts.append(f'                <details class="spot">\n'
+                         f'                    <summary>{html.escape(display_name(d.name))}</summary>\n'
+                         f'{_section_html(d)}\n'
+                         '                </details>')
+        parts.append('            </details>')
     parts.append('        </div>')
     return '\n'.join(parts)
 
@@ -221,13 +233,13 @@ def _section_html(ds_dir: pathlib.Path) -> str:
              f'            <h2>Dataset {html.escape(display_name(ds_dir.name))}</h2>']
 
     if (ds_dir / ANIMATION).exists():
-        parts.append(f'            <iframe class="animation-frame" '
+        parts.append(f'            <iframe class="animation-frame" loading="lazy" '
                      f'src="{name}/{ANIMATION}"></iframe>')
     for caption, filename in FIGURES:
         if not (ds_dir / filename).exists():
             continue
         parts.append('            <figure class="plot">\n'
-                     f'                <img class="plot-image" src="{name}/{filename}" '
+                     f'                <img class="plot-image" loading="lazy" src="{name}/{filename}" '
                      f'alt="{html.escape(display_name(ds_dir.name))} — {html.escape(caption)}">\n'
                      f'                <figcaption>{html.escape(caption)}</figcaption>\n'
                      '            </figure>')
@@ -339,6 +351,30 @@ STYLE = """        body {
             border-left: 6px solid #0066cc;
         }
 
+        details.spots > summary {
+            font-size: 1.3rem;
+            font-weight: 600;
+            color: #0066cc;
+            cursor: pointer;
+            margin-top: 30px;
+        }
+
+        details.spot {
+            margin: 12px 0 0 20px;
+        }
+
+        details.spot > summary {
+            font-size: 1.1rem;
+            cursor: pointer;
+            padding: 6px 0;
+        }
+
+        details.spot .section {
+            box-shadow: none;
+            border: 1px solid #e5e5e7;
+            margin: 10px 0 20px;
+        }
+
         .missing {
             color: #8a8a8e;
             font-style: italic;
@@ -356,14 +392,28 @@ def build_ds0n_summary(processed_dir=None, out_path=None,
     out_path = pathlib.Path(out_path or processed_dir / SUMMARY_PAGE)
 
     shown = datasets_to_show(processed_dir)
-    blocks, seen = [], set()
+    groups: dict[str, list[pathlib.Path]] = {}
     for d in shown:
-        base = _base_of(d.name)
-        if base not in seen:
-            seen.add(base)
-            if (processed_dir / base / REGION_ANIMATION).exists():
-                blocks.append(_region_section_html(processed_dir / base))
-        blocks.append(_section_html(d))
+        groups.setdefault(_base_of(d.name), []).append(d)
+    blocks, included = [], []
+    for base, spot_dirs in groups.items():
+        region_dir = processed_dir / base
+        if (region_dir / REGION_ANIMATION).exists():
+            # The region's own spots.csv says which spots this run kept. A folder left over
+            # from an earlier run into the same directory (another naming, other thresholds)
+            # is not one of them, and would otherwise be shown as if it were.
+            spots_csv = region_dir / 'spots.csv'
+            if spots_csv.exists():
+                table = pd.read_csv(spots_csv)
+                kept = set(table.loc[table['kept'].astype(bool), 'dir'])
+                stale = [d.name for d in spot_dirs if d.name not in kept]
+                if stale:
+                    print(f'{base}: not in this run, left out: {", ".join(stale)}')
+                spot_dirs = [d for d in spot_dirs if d.name in kept]
+            blocks.append(_region_section_html(region_dir, spot_dirs))
+        else:
+            blocks.extend(_section_html(d) for d in spot_dirs)
+        included.extend(spot_dirs)
     sections = '\n\n'.join(blocks)
 
     out_path.write_text(f"""<!DOCTYPE html>
@@ -388,6 +438,6 @@ def build_ds0n_summary(processed_dir=None, out_path=None,
 </html>
 """, encoding='utf-8')
 
-    print(f'Summary saved → {out_path}  ({len(shown)} datasets: '
-          f'{", ".join(display_name(d.name) for d in shown)})')
+    print(f'Summary saved → {out_path}  ({len(included)} datasets: '
+          f'{", ".join(display_name(d.name) for d in included)})')
     return out_path
