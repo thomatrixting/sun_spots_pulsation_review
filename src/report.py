@@ -35,9 +35,17 @@ ANIMATION = 'anim.html'
 FIGURES = (
     ('Mean field and mean velocity vs time', 'plots/time_series.png'),
     ('Region area vs time', 'plots/area_vs_time.png'),
-    # Only written by the automatic tracker (`03C`); a hand-split `03B` dataset has none.
-    ('Tracking overview: every spot of the region and its lifetime', 'plots/tracking_overview.png'),
 )
+
+#: Written by the automatic tracker (`03C`) into the region's own `<DS>/` folder. When it is
+#: there, the region gets a section of its own ahead of its spots, so every spot can be read
+#: against the whole box — that is where a wrong split or a missed spot shows.
+REGION_ANIMATION = 'anim_region.html'
+REGION_OVERVIEW = 'plots/tracking_overview.png'
+REGION_COLUMNS = (('spot', 'Spot'), ('parent', 'Parent'), ('time_start_h', 'Start (h)'),
+                  ('time_end_h', 'End (h)'), ('duration_h', 'Duration (h)'),
+                  ('median_umbra_px', 'Median umbra (px)'), ('end_reason', 'End'),
+                  ('kept', 'Kept'), ('reject_reason', 'Reject reason'))
 TIME_SERIES = FIGURES[0][1]
 
 #: (label, filename) of the peak tables `spectra.plot_spectra_compare` saves.
@@ -167,6 +175,46 @@ def _peak_table_html(rows: list[dict]) -> str:
             </table>"""
 
 
+def _region_section_html(region_dir: pathlib.Path) -> str:
+    name = html.escape(region_dir.name)
+    parts = [f'        <div class="section region">\n'
+             f'            <h2>Region {name} — all spots</h2>',
+             f'            <iframe class="animation-frame" src="{name}/{REGION_ANIMATION}"></iframe>']
+    if (region_dir / REGION_OVERVIEW).exists():
+        parts.append('            <figure class="plot">\n'
+                     f'                <img class="plot-image" src="{name}/{REGION_OVERVIEW}" '
+                     f'alt="{name} — tracking overview">\n'
+                     '                <figcaption>Tracking overview: solid = umbra, dashed = '
+                     'umbra + penumbra; lifetimes below, rejected spots in grey</figcaption>\n'
+                     '            </figure>')
+    spots_csv = region_dir / 'spots.csv'
+    if spots_csv.exists():
+        table = pd.read_csv(spots_csv).fillna('')
+        head = ''.join(f'<th>{label}</th>' for _, label in REGION_COLUMNS)
+        rows = []
+        for _, r in table.iterrows():
+            cells = []
+            for key, _ in REGION_COLUMNS:
+                value = r[key]
+                if isinstance(value, float):
+                    cells.append(f'<td class="num">{value:.1f}</td>')
+                else:
+                    cells.append(f'<td>{html.escape(str(value))}</td>')
+            rows.append('                    <tr>' + ''.join(cells) + '</tr>')
+        parts.append('            <h3>Spots tracked in this region</h3>')
+        parts.append('            <table class="peaks">\n'
+                     f'                <thead><tr>{head}</tr></thead>\n'
+                     '                <tbody>\n' + '\n'.join(rows) + '\n'
+                     '                </tbody>\n            </table>')
+    parts.append('        </div>')
+    return '\n'.join(parts)
+
+
+def _base_of(directory_name: str) -> str:
+    match = VARIANT.match(directory_name)
+    return match.group(1) if match else directory_name
+
+
 def _section_html(ds_dir: pathlib.Path) -> str:
     name = html.escape(ds_dir.name)
     parts = [f'        <div class="section">\n'
@@ -287,6 +335,10 @@ STYLE = """        body {
             font-variant-numeric: tabular-nums;
         }
 
+        .section.region {
+            border-left: 6px solid #0066cc;
+        }
+
         .missing {
             color: #8a8a8e;
             font-style: italic;
@@ -304,7 +356,15 @@ def build_ds0n_summary(processed_dir=None, out_path=None,
     out_path = pathlib.Path(out_path or processed_dir / SUMMARY_PAGE)
 
     shown = datasets_to_show(processed_dir)
-    sections = '\n\n'.join(_section_html(d) for d in shown)
+    blocks, seen = [], set()
+    for d in shown:
+        base = _base_of(d.name)
+        if base not in seen:
+            seen.add(base)
+            if (processed_dir / base / REGION_ANIMATION).exists():
+                blocks.append(_region_section_html(processed_dir / base))
+        blocks.append(_section_html(d))
+    sections = '\n\n'.join(blocks)
 
     out_path.write_text(f"""<!DOCTYPE html>
 <html lang="en">

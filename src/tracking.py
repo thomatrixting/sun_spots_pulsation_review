@@ -61,6 +61,7 @@ from scipy import ndimage
 
 from .config import DS0N_DEFAULTS, MIN_CLUSTER_PX
 from .plotting import save_figure
+from .report import REGION_ANIMATION
 
 
 @dataclasses.dataclass
@@ -216,13 +217,27 @@ class _Tracker:
             parent = self.spots[parent].parent
         return False
 
-    def _winner(self, a: str, b: str) -> tuple[str, str]:
+    def _winner(self, a: str, b: str, first: int, n_before: int = 10) -> tuple[str, str]:
+        """Ancestor over descendant; otherwise the larger, measured *before* the contact.
+
+        Not in the frame the merge is confirmed: during the `min_split_frames` of contact the
+        shared umbra is split by nearest previous umbra, and that split drifts frame after
+        frame — on DS02 it handed the smaller spot enough of the larger one's umbra to
+        "win" (868 vs 1214 px of umbra just before contact).
+        """
         if self._is_ancestor(a, b):
             return a, b
         if self._is_ancestor(b, a):
             return b, a
-        size = {n: sum(len(i) for i in self.spots[n].last()) for n in (a, b)}
-        return (a, b) if size[a] >= size[b] else (b, a)
+
+        def size(n):
+            s = self.spots[n]
+            before = sorted(tt for tt in s.frames if tt < first)[-n_before:]
+            if not before:
+                return sum(len(i) for i in s.last())
+            return float(np.median([len(s.frames[tt][0]) + len(s.frames[tt][1])
+                                    for tt in before]))
+        return (a, b) if size(a) >= size(b) else (b, a)
 
     def _event(self, t, kind, spot, other='', detail=''):
         self.events.append(dict(frame=t, event=kind, spot=spot, other=other, detail=detail))
@@ -315,9 +330,25 @@ class _Tracker:
         for name, cl in claims.items():
             for c in cl:
                 claimants.setdefault(c, []).append(name)
+        # Only two *main* umbrae joining is a merge of spots. A secondary fragment of one
+        # spot that runs into another spot's main umbra simply becomes part of that umbra:
+        # otherwise a stray fragment drags a whole spot into a merge, and the "larger"
+        # survivor is decided by fragments (on DS06 that renamed the main spot B as C).
+        primary = {n: max(cl, key=lambda c: (cl[c], fr.umb_size[c]))
+                   for n, cl in claims.items() if cl}
         pairs = set()
-        for names in claimants.values():
-            pairs |= {frozenset((a, b)) for i, a in enumerate(names) for b in names[i + 1:]}
+        for c, names in claimants.items():
+            if len(names) < 2:
+                continue
+            main = [n for n in names if primary.get(n) == c]
+            if main:
+                for n in names:
+                    if n not in main:
+                        del claims[n][c]
+                names[:] = main
+                pairs |= {frozenset((a, b)) for i, a in enumerate(main) for b in main[i + 1:]}
+            # No main umbra among them: fragments of different spots touching each other.
+            # They stay contested (split by nearest previous umbra), never a merge.
         for name, comp in foot_target.items():
             pairs |= {frozenset((name, o)) for o in members.get(comp, []) if o != name}
         self.merge_pending = {pair: ([self.merge_pending[pair][0] + 1,
@@ -337,7 +368,7 @@ class _Tracker:
             a, b = sorted(pair)
             if count < p.min_split_frames or not (self.spots[a].active and self.spots[b].active):
                 continue
-            win, lose = self._winner(a, b)
+            win, lose = self._winner(a, b, first)
             self._merge(win, lose, first, t)
             for c in claims.pop(lose, {}):
                 claims.setdefault(win, {}).setdefault(c, 0)
@@ -395,21 +426,25 @@ class _Tracker:
                 del claims[name][sec]
                 s.split_cand = None
 
-        # 5b. Umbra fragments that drifted into a *different* footprint component without
-        #     qualifying as a split (too small, or not a pending candidate) are let go, like
-        #     a penumbra fragment without umbra. Otherwise the spot keeps a second, unrelated
-        #     footprint — on DS02 that inflated spot D from a median 1.9k px to 14k px.
+        # 5b. An umbra fragment that drifted into a *different* footprint component without
+        #     qualifying as a split stays part of its spot's umbra — umbra continuity comes
+        #     first. Only its penumbra is left out when that component also holds another
+        #     spot, so the spot does not absorb a neighbour's footprint (on DS02 that had
+        #     inflated spot D from a median 1.9k px to 14k px).
+        members = self._members(
+            fr, {**claims, **{n: dict.fromkeys(cs, 0) for n, cs in new_children.items()}},
+            foot_target)
+        foreign_pen: dict[str, set] = {}
         for name in list(claims):
-            s = self.spots[name]
             own = sorted((c for c in claims[name] if c not in contested),
                          key=lambda c: (-claims[name][c], -fr.umb_size[c]))
             if len(own) < 2:
                 continue
-            home = fr.umb_foot[own[0]]
-            pending = s.split_cand['comp'] if s.split_cand else None
+            home = int(fr.umb_foot[own[0]])
             for c in own[1:]:
-                if fr.umb_foot[c] != home and c != pending:
-                    del claims[name][c]
+                f = int(fr.umb_foot[c])
+                if f != home and members.get(f, []) != [name]:
+                    foreign_pen.setdefault(name, set()).add(f)
 
         # 6. Write this frame's masks.
         foot_of: dict[str, set] = {}
@@ -425,6 +460,7 @@ class _Tracker:
                 umb = np.concatenate(parts) if parts else np.array([], dtype=np.int32)
                 comps = {int(fr.umb_foot[c]) for c in own}
                 comps |= {int(fr.umb_foot[c]) for c in contested if name in contested[c]}
+            comps -= foreign_pen.get(name, set())
             if not comps:
                 continue
             pen =np.concatenate([_pen_idx(fr, f, nx) for f in sorted(comps)])
@@ -635,17 +671,49 @@ def track_spots(cube_cont: np.ndarray, time_h: np.ndarray, ds_name: str = 'DS',
     for s in spots.values():
         if s.active:
             s.end_reason = 'end_of_data'
-    rows = []
-    for s in spots.values():
+    def stats(s):
         area = np.array([len(u) + len(pen) for u, pen in s.frames.values()])
         umb_area = np.array([len(u) for u, _ in s.frames.values()])
-        duration = float(time_h[s.t_end] - time_h[s.t_start])
+        return area, umb_area, float(time_h[s.t_end] - time_h[s.t_start])
+
+    for s in spots.values():
+        area, _, duration = stats(s)
         if s.parent is not None and s.penumbra_split:
             if np.median(area) < params.min_spot_px:
                 s.kept, s.reject_reason = False, f'median area {np.median(area):.0f} px'
             elif duration < params.min_duration_h:
                 s.kept, s.reject_reason = False, f'duration {duration:.1f} h'
-        rows.append(dict(
+
+    # Rows for rejected spots describe the spot itself, so take them before folding.
+    rows = {name: stats(s) for name, s in spots.items() if not s.kept}
+    # A rejected child is not a new spot, so its pixels were never anyone else's: fold them
+    # back into the nearest kept ancestor, which keeps that ancestor's umbra continuous
+    # instead of losing a piece for the child's lifetime. Latest first, so a rejected
+    # grandchild goes straight to a kept ancestor rather than into a rejected parent.
+    for name in sorted((n for n, s in spots.items() if not s.kept),
+                       key=lambda n: -spots[n].t_start):
+        s = spots[name]
+        target = s.parent
+        while target is not None and not spots[target].kept:
+            target = spots[target].parent
+        if target is None:
+            continue
+        tgt = spots[target]
+        for tt, (u, pen) in s.frames.items():
+            if tt in tgt.frames:
+                u_t, pen_t = tgt.frames[tt]
+                u_new = np.union1d(u_t, u)
+                tgt.frames[tt] = (u_new, np.setdiff1d(np.union1d(pen_t, pen), u_new))
+            else:
+                tgt.frames[tt] = (u, pen)
+        s.reject_reason += f'; folded into {target}'
+        tracker.events.append(dict(frame=s.t_start, event='folded', spot=name, other=target,
+                                   detail=s.reject_reason))
+
+    table_rows = []
+    for name, s in spots.items():
+        area, umb_area, duration = rows.get(name) or stats(s)
+        table_rows.append(dict(
             spot=display_name(ds_name, s), dir=dir_name(ds_name, s), parent=s.parent or '',
             t_start=s.t_start, t_end=s.t_end, time_start_h=float(time_h[s.t_start]),
             time_end_h=float(time_h[s.t_end]), duration_h=duration, n_frames=len(s.frames),
@@ -654,8 +722,9 @@ def track_spots(cube_cont: np.ndarray, time_h: np.ndarray, ds_name: str = 'DS',
             end_reason=s.end_reason, kept=s.kept, reject_reason=s.reject_reason))
     events = pd.DataFrame(tracker.events, columns=['frame', 'event', 'spot', 'other', 'detail'])
     if len(events):
+        events = events.sort_values('frame', kind='stable', ignore_index=True)
         events.insert(1, 'time_h', time_h[events['frame'].to_numpy()])
-    table = pd.DataFrame(rows).sort_values(['t_start', 'spot'], ignore_index=True)
+    table = pd.DataFrame(table_rows).sort_values(['t_start', 'spot'], ignore_index=True)
     return TrackResult(ds_name, cube_cont.shape, spots, events, table,
                        np.asarray(tracker.untracked), params)
 
@@ -717,6 +786,132 @@ def save_tracking_outputs(result: TrackResult, out_dir) -> None:
     np.savez_compressed(out_dir / 'masks.npz', **arrays)
 
 
+def spot_colors(result: TrackResult) -> dict[str, tuple]:
+    """One colour per spot, shared by the overview figure and the region animation.
+
+    tab10, not `plotting.BOX_COLORS`: those are for dark full-disk maps and include white,
+    which vanishes on the white lifetime panel.
+    """
+    import matplotlib.pyplot as plt
+
+    palette = plt.get_cmap('tab10').colors
+    names = sorted(result.spots, key=lambda n: (len(n), n))
+    return {n: palette[i % len(palette)] for i, n in enumerate(names)}
+
+
+def save_region_animation(data: dict, result: TrackResult, save_path, step: int | None = None,
+                          fps: int = 5):
+    """The `animation.save_animation` view for the whole box, with every spot at once.
+
+    Continuum / magnetogram / dopplergram, each spot in its overview colour — umbra filled
+    on the continuum and outlined on the other two, penumbra outlined — and named at its
+    umbra. Rejected spots are grey. Anything dark enough to be footprint that no spot holds
+    is outlined in white: that is where the tracker is *not* looking, so a white blob that
+    looks like a spot is the first thing to check.
+    """
+    import matplotlib
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, HTMLWriter
+
+    from .plotting import symmetric_limits
+
+    save_path = pathlib.Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    n_t, ny, nx = result.shape
+    step = step or max(1, n_t // 60)
+    frames_idx = np.arange(0, n_t, step)
+    colors = spot_colors(result)
+    p = result.params
+    structure = ndimage.generate_binary_structure(2, p.connectivity)
+
+    cubes = [data['cube_cont'], data['cube_mag'], data['cube_dop']]
+    sample = np.arange(0, n_t, max(1, n_t // 50))
+    clims = [np.nanpercentile(cubes[0][sample], [2, 98])]
+    for c in cubes[1:]:
+        vmax = symmetric_limits(c[sample], percentile=99)
+        clims.append(np.array([-vmax, vmax]))
+
+    def overlay(t, filled):
+        rgba = np.zeros((ny, nx, 4))
+        tracked = np.zeros(ny * nx, dtype=bool)
+        for name, s in result.spots.items():
+            if t not in s.frames:
+                continue
+            u_idx, pen_idx = s.frames[t]
+            color = colors[name] if s.kept else (0.6, 0.6, 0.6)
+            umb = np.zeros(ny * nx, dtype=bool); umb[u_idx] = True
+            pen = np.zeros(ny * nx, dtype=bool); pen[pen_idx] = True
+            tracked |= umb | pen
+            umb, pen = umb.reshape(ny, nx), pen.reshape(ny, nx)
+            pen_edge = ndimage.binary_dilation(pen | umb) & ~(pen | umb)
+            rgba[pen_edge, :3] = color; rgba[pen_edge, 3] = 0.95
+            if filled:
+                rgba[umb, :3] = color; rgba[umb, 3] = 0.55
+            else:
+                umb_edge = ndimage.binary_dilation(umb) & ~umb
+                rgba[umb_edge, :3] = color; rgba[umb_edge, 3] = 0.95
+        with np.errstate(invalid='ignore'):
+            dark = data['cube_cont'][t] < p.penumbra_thresh
+        lab, _ = ndimage.label(dark, structure=structure)
+        sizes = np.bincount(lab.ravel())
+        big = sizes >= p.min_cluster_px
+        big[0] = False
+        loose = big[lab] & ~tracked.reshape(ny, nx)
+        edge = ndimage.binary_dilation(loose) & ~loose & ~tracked.reshape(ny, nx)
+        rgba[edge, :3] = 1.0; rgba[edge, 3] = 0.9
+        return rgba
+
+    fig, axes = plt.subplots(1, 3, figsize=(19, 6.5 * max(ny / nx, 0.35) + 1.5))
+    fig.subplots_adjust(wspace=0.3, top=0.86, left=0.05, right=0.97)
+    ims, ovs, labels = [], [], []
+    names = list(result.spots)
+    for j, (ax, cube, cmap, clim, title, unit) in enumerate(zip(
+            axes, cubes, ['gray', 'bwr', 'RdBu_r'], clims,
+            ['Continuum', 'Magnetogram', 'Dopplergram'], ['DN', 'G', 'm/s'])):
+        ims.append(ax.imshow(cube[0], origin='lower', cmap=cmap, vmin=clim[0], vmax=clim[1],
+                             interpolation='nearest'))
+        fig.colorbar(ims[-1], ax=ax, label=f'{title} ({unit})', fraction=0.046, pad=0.04)
+        ovs.append(ax.imshow(overlay(0, j == 0), origin='lower', interpolation='nearest'))
+        ax.set_title(title, fontsize=12)
+        ax.set_xlabel('X (px)'); ax.set_ylabel('Y (px)')
+        labels.append({n: ax.text(0, 0, display_name('', result.spots[n])[1:],
+                                  color=colors[n] if result.spots[n].kept else '0.6',
+                                  fontsize=10, fontweight='bold', ha='center', va='center',
+                                  visible=False,
+                                  bbox=dict(boxstyle='round,pad=0.1', fc='black', alpha=0.4))
+                       for n in names})
+    suptitle = fig.suptitle('', fontsize=11)
+
+    def update(i):
+        t = frames_idx[i]
+        present = []
+        for j in range(3):
+            ims[j].set_data(cubes[j][t])
+            ovs[j].set_data(overlay(t, j == 0))
+        for n in names:
+            s = result.spots[n]
+            on = t in s.frames
+            if on:
+                u_idx, pen_idx = s.frames[t]
+                y, x = _centroid(u_idx if u_idx.size else pen_idx, nx)
+                present.append(display_name('', s)[1:])
+            for j in range(3):
+                labels[j][n].set_visible(on)
+                if on:
+                    labels[j][n].set_position((x, y))
+        suptitle.set_text(f'{result.ds_name}  |  frame {t:04d}  |  t = {data["time_h"][t]:.1f} h'
+                          f'  |  spots: {", ".join(present) or "none"}'
+                          f'  |  white = dark but untracked')
+        return ims + ovs
+
+    matplotlib.rcParams['animation.embed_limit'] = 50.0
+    anim = FuncAnimation(fig, update, frames=len(frames_idx), interval=1000 // fps, blit=False)
+    plt.close(fig)
+    anim.save(str(save_path), writer=HTMLWriter(fps=fps, embed_frames=False))
+    print(f'Region animation saved → {save_path}  ({len(frames_idx)} frames)')
+    return save_path
+
+
 def plot_tracking_overview(cube_cont: np.ndarray, result: TrackResult, time_h: np.ndarray,
                            plots_dir=None, save: bool = True, n_panels: int = 4):
     """Continuum at a few frames with every kept spot outlined and named, plus a lifeline
@@ -730,10 +925,7 @@ def plot_tracking_overview(cube_cont: np.ndarray, result: TrackResult, time_h: n
     valid = np.flatnonzero(np.isfinite(cube_cont).any(axis=(1, 2)))
     frames = valid[np.linspace(0, len(valid) - 1, n_panels).round().astype(int)]
     names = sorted(result.spots, key=lambda n: (len(n), n))
-    # tab10, not BOX_COLORS: those are for dark full-disk maps and include white, which
-    # vanishes on the white lifetime panel.
-    palette = plt.get_cmap('tab10').colors
-    colors = {n: palette[i % len(palette)] for i, n in enumerate(names)}
+    colors = spot_colors(result)
     _, ny, nx = result.shape
 
     image_h = 4.5 * max(ny / nx, 0.4)
@@ -825,17 +1017,19 @@ def run_spot_pipeline(sdata: dict, out_dir, use_absolute_mag: bool = True) -> di
     return metrics
 
 
+
+
 def process_region(ds_dir, out_root, params: TrackingParams | None = None,
                    run_pipeline: bool = True) -> TrackResult:
     """One raw DS0N directory end to end: load, track, save, and run `03B` on every kept spot.
 
-    Writes ``out_root/<DS>/`` (spots.csv, events.csv, masks.npz, plots/tracking_overview.png)
+    Writes ``out_root/<DS>/`` (spots.csv, events.csv, masks.npz, plots/tracking_overview.png,
+    the all-spots animation)
     and one ``out_root/<DS>_<spot>/`` per kept spot laid out exactly like a `03B` output
     directory, so `report.build_ds0n_summary(out_root)` picks them up unchanged. A spot whose
     pipeline fails is recorded in ``spots.csv`` (``pipeline_error``) rather than stopping the
     region.
     """
-    import shutil
     import traceback
 
     from .loaders import load_ds0n_region, verify_cadence
@@ -854,7 +1048,7 @@ def process_region(ds_dir, out_root, params: TrackingParams | None = None,
 
     ds_out = out_root / ds_dir.name
     plot_tracking_overview(data['cube_cont'], result, data['time_h'], plots_dir=ds_out / 'plots')
-    overview = ds_out / 'plots' / 'tracking_overview.png'
+    save_region_animation(data, result, ds_out / REGION_ANIMATION)
 
     errors = {}
     if run_pipeline:
@@ -863,7 +1057,6 @@ def process_region(ds_dir, out_root, params: TrackingParams | None = None,
             print(f'── {display_name(ds_dir.name, s)}  ({len(s.frames)} frames)')
             try:
                 run_spot_pipeline(spot_data(data, result, s.name), spot_dir)
-                shutil.copy(overview, spot_dir / 'plots' / overview.name)
             except Exception as exc:                 # noqa: BLE001 — record, keep going
                 errors[display_name(ds_dir.name, s)] = f'{type(exc).__name__}: {exc}'
                 traceback.print_exc()
