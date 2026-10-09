@@ -7,6 +7,10 @@ follows them through splits and merges, and hands back umbra / penumbra masks pe
 the same `data` dict shape `load_ds0n_region` returns — so `analysis`, `spectra` and
 `animation` run on each spot unchanged.
 
+**The invariant every rule keeps: a spot's region (umbra + penumbra) is one connected
+piece in every frame.** Anything that breaks off is either a new spot or discarded — never
+carried along as a second piece of the old one.
+
 The rules, in the order the tracker applies them each frame:
 
 * **A spot** is a connected component (8-connectivity) of the footprint ``cont <
@@ -26,22 +30,34 @@ The rules, in the order the tracker applies them each frame:
   child named ``<parent><letter>`` (``A`` -> ``AA``, ``AB``; ``AA`` -> ``AAA``), dated back
   to the first of those frames. Without the persistence test the umbra boundary flickering
   across the threshold would spawn a child every few frames.
-* **Shared penumbra.** Every spot's penumbra is the non-umbra part of the footprint
-  component(s) its umbra lies in. A parent and child in the same component therefore share
-  the same penumbra pixels; once their umbrae sit in different components for
-  `min_split_frames` frames, the child is marked ``penumbra_split``.
+* **Home.** A spot's region lives in one footprint component, its *home*: the one holding
+  its main umbra (or, without umbra, the one it overlaps most). Its penumbra is the home's
+  non-umbra pixels; a parent and an umbra-split child in the same home share it. Once their
+  umbrae sit in different components for `min_split_frames` frames, the child is marked
+  ``penumbra_split``.
+* **Penumbra break.** Any other footprint component the spot touches is a detached piece.
+  A piece of at least `min_spot_px` with umbra that stays apart `min_split_frames` frames
+  becomes a child with its own penumbra, dated back to the break. Meanwhile, and for any
+  piece that is too small, has no umbra, or rejoins, the piece belongs to no spot.
+* **Small umbra fragments** inside the home that could never be a split (under
+  `min_umbra_split_px` or `min_split_fraction`) are dropped from both masks, so they bias
+  neither the umbra nor the penumbra mean. Penumbra pixels cut off by that (1-10 px islands)
+  are dropped too.
 * **Merge.** Two spots claiming the same umbra component — or a spot without umbra sitting
   in another spot's footprint component — for `min_split_frames` consecutive frames merge.
   An ancestor always survives its own descendant (``A`` over ``AA`` over ``AAB``);
   otherwise the larger survives. The loser ends at the frame the contact began, and the
-  umbra pixels it held during the contact frames go to the survivor. While a contact is
+  umbra pixels it held during the contact frames go to the survivor (only in frames where
+  the two share a footprint, so the survivor stays one piece). While a contact is
   still pending the contested umbra is split between the spots by nearest previous umbra.
 * **Filters**, after the whole cube: a child whose penumbra split must have a median area
-  of at least `min_spot_px` and last at least `min_duration_h`. Children that only ever
+  of at least `min_spot_px` and last at least `min_duration_h`. A rejected child gives its
+  ancestor back only the frames in which they still shared a footprint; its frames as a
+  separate region are discarded. Children that only ever
   split their umbra are exempt, and are shown with a trailing ``'`` (``DS00_AA'``; ``p`` on
   disk, ``DS00_AAp``) — but one that rejoins within `heal_within_h` is annulled outright
-  ("healed"): it was a light bridge or a gap between umbral dots, not a spot. The initial spots are exempt too, having passed the size test to be
-  detected at all.
+  ("healed"): it was a light bridge or a gap between umbral dots, not a spot. The initial
+  spots are exempt too, having passed the size test to be detected at all.
 
 A spot that *emerges* mid-window without splitting off a tracked one is not followed. The
 tracker counts how many frames held such an untracked spot-sized component, so the size of
@@ -102,6 +118,9 @@ class Spot:
     missing: int = 0
     n_children: int = 0
     split_cand: dict | None = None
+    # Detached footprint pieces waiting to become a spot: dicts with `history`, a list of
+    # (t, umbra_idx, penumbra_idx), and `last`, the piece's footprint pixels in its last frame.
+    piece_cands: list = dataclasses.field(default_factory=list)
     pen_sep_count: int = 0
     # Filled by `_finalise`.
     kept: bool = True
@@ -180,6 +199,32 @@ def _umb_idx(fr: _Frame, comp: int, nx: int) -> np.ndarray:
 def _pen_idx(fr: _Frame, foot_comp: int, nx: int) -> np.ndarray:
     sl = fr.foot_obj[foot_comp - 1]
     return _local_idx((fr.foot_lab[sl] == foot_comp) & (fr.umb_lab[sl] == 0), sl, nx)
+
+
+def _largest_piece(umb: np.ndarray, pen: np.ndarray, nx: int, structure):
+    """Keep only the largest connected piece of umb ∪ pen.
+
+    Taking out a dropped umbra fragment, another spot's umbra in a shared penumbra, or a
+    child's umbra after the fact can cut a few penumbra pixels off the rest (1-10 px
+    islands on DS00-DS09). They are discarded like any other detached piece, so a region
+    is one piece in every frame.
+    """
+    idx = np.concatenate([umb, pen])
+    if idx.size == 0:
+        return umb, pen
+    yy, xx = idx // nx, idx % nx
+    y0, x0 = yy.min(), xx.min()
+    h, w = yy.max() - y0 + 1, xx.max() - x0 + 1
+    local = (yy - y0) * w + (xx - x0)
+    mask = np.zeros(h * w, dtype=bool)
+    mask[local] = True
+    lab, n = ndimage.label(mask.reshape(h, w), structure=structure)
+    if n <= 1:
+        return umb, pen
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0
+    keep = lab.ravel()[local] == sizes.argmax()
+    return umb[keep[:umb.size]], pen[keep[umb.size:]]
 
 
 def _centroid(idx: np.ndarray, nx: int) -> np.ndarray:
@@ -380,6 +425,86 @@ class _Tracker:
         self.merge_pending = {pair: v for pair, v in self.merge_pending.items()
                               if all(self.spots[n].active for n in pair)}
 
+        # 3b. Continuity: a spot's region is ONE connected footprint component, its *home*
+        #     — the component holding its main umbra (or, without umbra, the one it overlaps
+        #     most). Umbra it claims in any other component, and any other component its
+        #     previous footprint overlaps, are *detached pieces*: never part of this spot.
+        home: dict[str, int] = {}
+        for name, cl in claims.items():
+            if self.spots[name].active and cl:
+                main = max(cl, key=lambda c: (cl[c], fr.umb_size[c]))
+                home[name] = int(fr.umb_foot[main])
+        for name, comp in foot_target.items():
+            if self.spots[name].active:
+                home[name] = comp
+        homes = set(home.values())
+        pieces: dict[str, set] = {}
+        for name, h in home.items():
+            s = self.spots[name]
+            umb_prev, pen_prev = s.last()
+            foot_prev = np.concatenate([umb_prev, pen_prev])
+            touched = set(np.unique(fr.foot_lab.ravel()[foot_prev]).tolist())
+            for c in list(claims.get(name, {})):
+                f = int(fr.umb_foot[c])
+                if f != h:
+                    del claims[name][c]
+                    touched.add(f)
+            pieces[name] = touched - homes - {0}
+        claimants = {}
+        for name, cl in claims.items():
+            for c in cl:
+                claimants.setdefault(c, []).append(name)
+
+        # 3c. Detached pieces: one big enough to be a spot (`min_spot_px`, with umbra) that
+        #     stays apart `min_split_frames` frames becomes a child with its own penumbra;
+        #     anything else — too small, no umbra, rejoining, cut short — is discarded.
+        with_umbra = set(fr.umb_foot[1:].tolist())
+
+        def qualifies(f):
+            return fr.foot_size[f] >= p.min_spot_px and f in with_umbra
+
+        def piece_pixels(f):
+            sl = fr.foot_obj[f - 1]
+            umb = _local_idx((fr.foot_lab[sl] == f) & (fr.umb_lab[sl] > 0), sl, nx)
+            return umb, _pen_idx(fr, f, nx)
+
+        used: set = set()
+        new_spots: dict[str, int] = {}
+        for name in list(home):
+            s = self.spots[name]
+            still = []
+            for cand in s.piece_cands:
+                ov = np.bincount(fr.foot_lab.ravel()[cand['last']], minlength=len(fr.foot_size))
+                ov[0] = 0
+                f = int(ov.argmax()) if ov.any() else 0
+                if f == 0 or f in homes or f in used or not qualifies(f):
+                    continue                      # rejoined, absorbed, gone, or too small
+                umb, pen = piece_pixels(f)
+                cand['history'].append((t, umb, pen))
+                cand['last'] = np.concatenate([umb, pen])
+                used.add(f)
+                still.append(cand)
+            for f in sorted(pieces.get(name, set()) - used):
+                if qualifies(f):
+                    umb, pen = piece_pixels(f)
+                    still.append(dict(history=[(t, umb, pen)], last=np.concatenate([umb, pen])))
+                    used.add(f)
+            s.piece_cands = []
+            for cand in still:
+                if len(cand['history']) < p.min_split_frames:
+                    s.piece_cands.append(cand)
+                    continue
+                child = Spot(self._child_name(s), name, cand['history'][0][0])
+                child.penumbra_split = True
+                child.pen_sep_count = p.min_split_frames
+                for tt, umb, pen in cand['history']:
+                    child.frames[tt] = (umb, pen)
+                self.spots[child.name] = child
+                f = int(np.bincount(fr.foot_lab.ravel()[cand['last']]).argmax())
+                new_spots[child.name] = f
+                self._event(child.t_start, 'split_penumbra', child.name, name,
+                            f'detached piece of {fr.foot_size[f]} px, confirmed at frame {t}')
+
         # 4. Contested umbra still pending: split it by nearest previous umbra.
         shares: dict[str, list[np.ndarray]] = {}
         contested = {c: names for c, names in claimants.items() if len(names) > 1}
@@ -387,8 +512,11 @@ class _Tracker:
             for name, idx in self._partition(fr, c, names).items():
                 shares.setdefault(name, []).append(idx)
 
-        # 5. Umbra splits, with the persistence test.
+        # 5. Umbra splits inside the home, with the persistence test. Secondary umbra
+        #    fragments too small to ever be a split are dropped from the masks altogether
+        #    (neither umbra nor penumbra), so they bias neither mean.
         new_children: dict[str, list[int]] = {}
+        dropped: dict[str, set] = {}
         for name in list(claims):
             s = self.spots[name]
             if not s.active:
@@ -401,6 +529,7 @@ class _Tracker:
             total = sum(fr.umb_size[c] for c in own)
             rest = [c for c in own[1:] if fr.umb_size[c] >= p.min_umbra_split_px
                     and fr.umb_size[c] >= p.min_split_fraction * total]
+            dropped[name] = set(own[1:]) - set(rest)
             if not rest:
                 s.split_cand = None
                 continue
@@ -426,47 +555,28 @@ class _Tracker:
                 del claims[name][sec]
                 s.split_cand = None
 
-        # 5b. An umbra fragment that drifted into a *different* footprint component without
-        #     qualifying as a split stays part of its spot's umbra — umbra continuity comes
-        #     first. Only its penumbra is left out when that component also holds another
-        #     spot, so the spot does not absorb a neighbour's footprint (on DS02 that had
-        #     inflated spot D from a median 1.9k px to 14k px).
-        members = self._members(
-            fr, {**claims, **{n: dict.fromkeys(cs, 0) for n, cs in new_children.items()}},
-            foot_target)
-        foreign_pen: dict[str, set] = {}
-        for name in list(claims):
-            own = sorted((c for c in claims[name] if c not in contested),
-                         key=lambda c: (-claims[name][c], -fr.umb_size[c]))
-            if len(own) < 2:
-                continue
-            home = int(fr.umb_foot[own[0]])
-            for c in own[1:]:
-                f = int(fr.umb_foot[c])
-                if f != home and members.get(f, []) != [name]:
-                    foreign_pen.setdefault(name, set()).add(f)
-
-        # 6. Write this frame's masks.
-        foot_of: dict[str, set] = {}
+        # 6. Write this frame's masks: umbra from the home only, penumbra = the home's
+        #    non-umbra pixels. Children confirmed from a detached piece in 3c already have
+        #    this frame written.
+        foot_of: dict[str, set] = {name: {f} for name, f in new_spots.items()}
         for name in list(claims) + list(new_children) + list(foot_target):
             s = self.spots[name]
             if not s.active:
                 continue
             if name in foot_target:
-                comps, umb = {foot_target[name]}, np.array([], dtype=np.int32)
+                h, umb = foot_target[name], np.array([], dtype=np.int32)
             else:
-                own = new_children.get(name) or [c for c in claims[name] if c not in contested]
+                own = new_children.get(name) or [
+                    c for c in claims[name]
+                    if c not in contested and c not in dropped.get(name, set())]
                 parts = [_umb_idx(fr, c, nx) for c in own] + shares.get(name, [])
                 umb = np.concatenate(parts) if parts else np.array([], dtype=np.int32)
-                comps = {int(fr.umb_foot[c]) for c in own}
-                comps |= {int(fr.umb_foot[c]) for c in contested if name in contested[c]}
-            comps -= foreign_pen.get(name, set())
-            if not comps:
+                h = int(fr.umb_foot[own[0]]) if name in new_children else home.get(name)
+            if not h:
                 continue
-            pen =np.concatenate([_pen_idx(fr, f, nx) for f in sorted(comps)])
-            s.frames[t] = (umb, pen)
+            s.frames[t] = _largest_piece(umb, _pen_idx(fr, h, nx), nx, self.structure)
             s.missing = 0
-            foot_of[name] = comps
+            foot_of[name] = {h}
 
         # 7. Penumbra separation of children from their (still active) parent.
         for name, comps in foot_of.items():
@@ -482,7 +592,6 @@ class _Tracker:
                 s.pen_sep_count = 0
 
         tracked = set().union(*foot_of.values()) if foot_of else set()
-        with_umbra = set(fr.umb_foot[1:].tolist())
         self.untracked.append(sum(1 for c in range(1, len(fr.foot_size))
                                   if fr.foot_size[c] >= p.min_spot_px and c in with_umbra
                                   and c not in tracked))
@@ -525,14 +634,33 @@ class _Tracker:
         if l.prime and self.time_h[t] - self.time_h[l.t_start] < heal_h:
             self._heal(w, l, t)
             return
-        for tt in [tt for tt in l.frames if tt >= first]:
-            u_l, _ = l.frames.pop(tt)
-            if tt in w.frames:
-                u_w, pen_w = w.frames[tt]
-                w.frames[tt] = (np.union1d(u_w, u_l), np.setdiff1d(pen_w, u_l))
+        self._absorb(w, {tt: l.frames.pop(tt) for tt in [tt for tt in l.frames if tt >= first]})
         l.active = False
         l.end_reason = f'merged_into:{win}'
         self._event(first, 'merge', lose, win, f'confirmed at frame {t}')
+
+    @staticmethod
+    def _absorb(target: Spot, frames: dict, create_missing: bool = True) -> int:
+        """Give `frames` to `target`, but only in frames where the two regions share their
+        footprint: adding a piece in another footprint would break `target` into two.
+        Where `target` has no region at all the frame is given whole when `create_missing`.
+        Returns how many frames were absorbed."""
+        n = 0
+        for tt, (u, pen) in frames.items():
+            if tt in target.frames:
+                u_t, pen_t = target.frames[tt]
+                # Same footprint component <=> same penumbra pixels (each spot's penumbra
+                # is its whole home minus all umbra).
+                if not np.intersect1d(pen, pen_t).size:
+                    continue
+                u_new = np.union1d(u_t, u)
+                target.frames[tt] = (u_new, np.setdiff1d(np.union1d(pen_t, pen), u_new))
+            elif create_missing:
+                target.frames[tt] = (u, pen)
+            else:
+                continue
+            n += 1
+        return n
 
     def _heal(self, w: Spot, l: Spot, t: int):
         """An umbra-only split that closes up again within `min_duration_h` was a light
@@ -543,12 +671,7 @@ class _Tracker:
         89 confirmed umbra splits in 180 h, nearly all rejoining within hours — and each
         one also cuts a temporary hole into its parent's umbra series.
         """
-        for tt, (u_l, pen_l) in l.frames.items():
-            if tt in w.frames:
-                u_w, pen_w = w.frames[tt]
-                w.frames[tt] = (np.union1d(u_w, u_l), np.setdiff1d(pen_w, u_l))
-            else:
-                w.frames[tt] = (u_l, pen_l)
+        self._absorb(w, l.frames)
         for child in self.spots.values():
             if child.parent == l.name:
                 child.parent = w.name
@@ -686,10 +809,11 @@ def track_spots(cube_cont: np.ndarray, time_h: np.ndarray, ds_name: str = 'DS',
 
     # Rows for rejected spots describe the spot itself, so take them before folding.
     rows = {name: stats(s) for name, s in spots.items() if not s.kept}
-    # A rejected child is not a new spot, so its pixels were never anyone else's: fold them
-    # back into the nearest kept ancestor, which keeps that ancestor's umbra continuous
-    # instead of losing a piece for the child's lifetime. Latest first, so a rejected
-    # grandchild goes straight to a kept ancestor rather than into a rejected parent.
+    # A rejected child is not a new spot. Its frames that still shared the ancestor's
+    # footprint (the umbra-only phase) go back to the nearest kept ancestor, so that umbra
+    # stays whole; the frames after its penumbra split are a separate region and are
+    # discarded, since adding them would break the ancestor in two. Latest first, so a
+    # rejected grandchild goes straight to a kept ancestor rather than into a rejected parent.
     for name in sorted((n for n, s in spots.items() if not s.kept),
                        key=lambda n: -spots[n].t_start):
         s = spots[name]
@@ -698,17 +822,17 @@ def track_spots(cube_cont: np.ndarray, time_h: np.ndarray, ds_name: str = 'DS',
             target = spots[target].parent
         if target is None:
             continue
-        tgt = spots[target]
-        for tt, (u, pen) in s.frames.items():
-            if tt in tgt.frames:
-                u_t, pen_t = tgt.frames[tt]
-                u_new = np.union1d(u_t, u)
-                tgt.frames[tt] = (u_new, np.setdiff1d(np.union1d(pen_t, pen), u_new))
-            else:
-                tgt.frames[tt] = (u, pen)
-        s.reject_reason += f'; folded into {target}'
+        n = _Tracker._absorb(spots[target], s.frames, create_missing=False)
+        s.reject_reason += (f'; {n} shared frame(s) folded into {target}, '
+                            f'{len(s.frames) - n} discarded')
         tracker.events.append(dict(frame=s.t_start, event='folded', spot=name, other=target,
                                    detail=s.reject_reason))
+
+    # Last guarantee of the invariant: the steps that rewrite frames after the fact (a
+    # child's umbra taken out of its parent, merges, heals, folds) can leave tiny islands.
+    for s in spots.values():
+        for tt, (u, pen) in s.frames.items():
+            s.frames[tt] = _largest_piece(u, pen, cube_cont.shape[2], tracker.structure)
 
     table_rows = []
     for name, s in spots.items():
