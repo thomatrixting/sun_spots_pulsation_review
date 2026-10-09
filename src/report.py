@@ -35,6 +35,8 @@ ANIMATION = 'anim.html'
 FIGURES = (
     ('Mean field and mean velocity vs time', 'plots/time_series.png'),
     ('Region area vs time', 'plots/area_vs_time.png'),
+    # Only written by the automatic tracker (`03C`); a hand-split `03B` dataset has none.
+    ('Tracking overview: every spot of the region and its lifetime', 'plots/tracking_overview.png'),
 )
 TIME_SERIES = FIGURES[0][1]
 
@@ -60,9 +62,18 @@ def has_output(ds_dir: pathlib.Path) -> bool:
     return (ds_dir / ANIMATION).exists() or (ds_dir / TIME_SERIES).exists()
 
 
-#: A dataset as delivered, `DS00`, and a per-spot variant of one, `DS00_A`.
+#: A dataset as delivered, `DS00`, and a per-spot variant of one: `DS00_A` by hand in `03B`,
+#: or from the tracker in `03C` also `DS00_AA` (a split) and `DS00_AAp` (an umbra-only split,
+#: shown as `DS00_AA'` — see `display_name`).
 BASE = re.compile(r'^DS\d+$')
-VARIANT = re.compile(r'^(DS\d+)_([A-Z])$')
+VARIANT = re.compile(r'^(DS\d+)_([A-Z]+p?)$')
+
+
+def display_name(directory_name: str) -> str:
+    """`DS00_AAp` -> `DS00_AA'`. The prime lives only on the page: on disk it is a `p`, so
+    the directory never needs quoting in a shell."""
+    return directory_name[:-1] + "'" if VARIANT.match(directory_name) and \
+        directory_name.endswith('p') else directory_name
 
 
 def datasets_to_show(processed_dir: pathlib.Path, has_data=None) -> list[pathlib.Path]:
@@ -158,7 +169,8 @@ def _peak_table_html(rows: list[dict]) -> str:
 
 def _section_html(ds_dir: pathlib.Path) -> str:
     name = html.escape(ds_dir.name)
-    parts = [f'        <div class="section">\n            <h2>Dataset {name}</h2>']
+    parts = [f'        <div class="section">\n'
+             f'            <h2>Dataset {html.escape(display_name(ds_dir.name))}</h2>']
 
     if (ds_dir / ANIMATION).exists():
         parts.append(f'            <iframe class="animation-frame" '
@@ -168,7 +180,7 @@ def _section_html(ds_dir: pathlib.Path) -> str:
             continue
         parts.append('            <figure class="plot">\n'
                      f'                <img class="plot-image" src="{name}/{filename}" '
-                     f'alt="{name} — {html.escape(caption)}">\n'
+                     f'alt="{html.escape(display_name(ds_dir.name))} — {html.escape(caption)}">\n'
                      f'                <figcaption>{html.escape(caption)}</figcaption>\n'
                      '            </figure>')
 
@@ -317,5 +329,5 @@ def build_ds0n_summary(processed_dir=None, out_path=None,
 """, encoding='utf-8')
 
     print(f'Summary saved → {out_path}  ({len(shown)} datasets: '
-          f'{", ".join(d.name for d in shown)})')
+          f'{", ".join(display_name(d.name) for d in shown)})')
     return out_path
