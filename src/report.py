@@ -8,7 +8,7 @@ moved — `sumary_DS01.html` still points at a `/mnt/ubuntu/home/...` that no lo
 a threshold is retuned and `03B` re-runs.
 
 So the page is generated from the directory instead: whatever `03B` last wrote is what it
-shows, and it uses paths relative to itself, so the whole `sebastian_sun_spots` folder can
+shows, and it uses paths relative to itself, so the whole output folder (`manual/` or `automatic/`) can
 be copied anywhere and still open.
 """
 
@@ -20,7 +20,7 @@ import re
 
 import pandas as pd
 
-from .config import DS0N_PROCESSED_DIR
+from .config import DS0N_MANUAL_DIR
 
 #: The page itself, written into `processed_dir`. This is the file that was previously
 #: maintained by hand, and it keeps its name so existing bookmarks still open it.
@@ -388,7 +388,7 @@ def build_ds0n_summary(processed_dir=None, out_path=None,
     Every link is relative to the page, which sits in `processed_dir` alongside the
     dataset folders, so the folder stays self-contained when it is copied or shared.
     """
-    processed_dir = pathlib.Path(processed_dir or DS0N_PROCESSED_DIR)
+    processed_dir = pathlib.Path(processed_dir or DS0N_MANUAL_DIR)
     out_path = pathlib.Path(out_path or processed_dir / SUMMARY_PAGE)
 
     shown = datasets_to_show(processed_dir)

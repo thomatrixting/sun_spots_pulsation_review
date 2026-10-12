@@ -37,6 +37,11 @@ RAW_DIR = DATA_DIR / 'raw'
 PROCESSED_DIR = DATA_DIR / 'processed'
 DS0N_RAW_DIR = RAW_DIR / 'sebastian_sun_spots'
 DS0N_PROCESSED_DIR = PROCESSED_DIR / 'sebastian_sun_spots'
+# Two lines of DS0N output, never mixed: `manual/` is `03B` (spots separated by hand, one
+# folder per spot), `automatic/` is `03C` / `scripts/track_spots.py` (the tracker's regions
+# and spots, each with its `tracking_meta.json`).
+DS0N_MANUAL_DIR = DS0N_PROCESSED_DIR / 'manual'
+DS0N_AUTO_DIR = DS0N_PROCESSED_DIR / 'automatic'
 
 
 def project_root() -> pathlib.Path:

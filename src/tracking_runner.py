@@ -40,7 +40,7 @@ META_FILE = 'tracking_meta.json'
 PIPELINE_VERSION = 1
 PIPELINE = {'version': PIPELINE_VERSION, 'use_absolute_mag': True}
 REGION = re.compile(r'^DS\d+$')
-SUMMARY_TITLE = 'Sun Spot Pulsation Review — DS0N automatic spot tracking (testing)'
+SUMMARY_TITLE = 'Sun Spot Pulsation Review — DS0N automatic spot tracking'
 
 
 # ── params and metadata ─────────────────────────────────────────────────────

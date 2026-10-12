@@ -8,7 +8,7 @@ Examples (from the project root, in the `sun-spots` env):
     python scripts/track_spots.py                         # everything, params from tracking_params.json
     python scripts/track_spots.py --datasets DS00 DS05    # only these
     python scripts/track_spots.py --n-datasets 10 --min-spot-px 300
-    python scripts/track_spots.py --params my.json --out-root data/processed/sebastian_sun_spots/test2
+    python scripts/track_spots.py --params my.json --out-root data/processed/sebastian_sun_spots/automatic_test2
     python scripts/track_spots.py --datasets DS00 --recompute   # ignore metadata, redo everything
     python scripts/track_spots.py --no-pipeline           # tracking + overview only (fast, for tuning)
 """
@@ -49,8 +49,8 @@ def main(argv=None) -> int:
     ap.add_argument('--datasets', nargs='+', metavar='DSNN', help='only these datasets')
     ap.add_argument('--n-datasets', type=int, help='stop after this many datasets that load')
     ap.add_argument('--out-root', type=pathlib.Path,
-                    default=config.DS0N_PROCESSED_DIR / 'testing',
-                    help='output folder (default: data/processed/sebastian_sun_spots/testing)')
+                    default=config.DS0N_AUTO_DIR,
+                    help='output folder (default: data/processed/sebastian_sun_spots/automatic)')
     ap.add_argument('--no-pipeline', action='store_true',
                     help='track and write the overview only, no per-spot analysis')
     ap.add_argument('--recompute', action='store_true',
