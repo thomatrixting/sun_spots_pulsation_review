@@ -903,11 +903,21 @@ def save_tracking_outputs(result: TrackResult, out_dir) -> None:
     result.events.to_csv(out_dir / 'events.csv', index=False)
     arrays = {'shape': np.array(result.shape)}
     for s in result.spots.values():
-        for k, part in (('umbra', 0), ('penumbra', 1)):
-            pairs = [np.column_stack([np.full(len(v[part]), t), v[part]])
-                     for t, v in sorted(s.frames.items())]
-            arrays[f'{dir_name(result.ds_name, s)}_{k}'] = np.concatenate(pairs).astype(np.int32)
+        umb, pen = mask_arrays(s)
+        arrays[f'{dir_name(result.ds_name, s)}_umbra'] = umb
+        arrays[f'{dir_name(result.ds_name, s)}_penumbra'] = pen
     np.savez_compressed(out_dir / 'masks.npz', **arrays)
+
+
+def mask_arrays(spot: Spot) -> tuple[np.ndarray, np.ndarray]:
+    """The spot's umbra and penumbra as int32 (frame, flat pixel index) pairs — the exact
+    arrays `masks.npz` holds, so a fingerprint of them reads the same from disk or memory."""
+    out = []
+    for part in (0, 1):
+        pairs = [np.column_stack([np.full(len(v[part]), t), v[part]])
+                 for t, v in sorted(spot.frames.items())]
+        out.append(np.concatenate(pairs).astype(np.int32))
+    return out[0], out[1]
 
 
 def spot_colors(result: TrackResult) -> dict[str, tuple]:

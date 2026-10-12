@@ -1,0 +1,14 @@
+{
+  "umbra_thresh": 30000,
+  "penumbra_thresh": 50000,
+  "max_initial_spots": 4,
+  "min_spot_px": 400,
+  "min_umbra_split_px": 150,
+  "min_split_fraction": 0.25,
+  "min_split_frames": 5,
+  "min_duration_h": 12.0,
+  "heal_within_h": 24.0,
+  "min_cluster_px": 50,
+  "max_missing_frames": 3,
+  "connectivity": 2
+}
