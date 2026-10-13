@@ -920,6 +920,32 @@ def mask_arrays(spot: Spot) -> tuple[np.ndarray, np.ndarray]:
     return out[0], out[1]
 
 
+def roundness(pairs: np.ndarray, nx: int, t_start: int, n_frames: int,
+              min_px: int = 10) -> np.ndarray:
+    """Per-frame roundness b/a of a mask given as `mask_arrays` (frame, flat index) pairs:
+    the ratio of the minor to the major axis of the ellipse with the same second moments.
+
+    1 is a disc, → 0 a line. Moments rather than 4πA/P², because the perimeter of a pixel
+    mask is dominated by its ragged edge (penumbral filaments, single-pixel umbral dots).
+    All pixels of the frame count, so an umbra in several pieces is measured as one cloud.
+    Returns `n_frames` values for frames t_start..t_start+n_frames-1, NaN where the mask has
+    fewer than `min_px` pixels (missing frames included).
+    """
+    t = pairs[:, 0] - t_start
+    y, x = np.divmod(pairs[:, 1].astype(np.int64), nx)
+    n = np.bincount(t, minlength=n_frames).astype(float)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        mx, my = (np.bincount(t, v, n_frames) / n for v in (x, y))
+        sxx = np.bincount(t, x * x, n_frames) / n - mx ** 2
+        syy = np.bincount(t, y * y, n_frames) / n - my ** 2
+        sxy = np.bincount(t, x * y, n_frames) / n - mx * my
+        half_tr = (sxx + syy) / 2
+        root = np.sqrt(((sxx - syy) / 2) ** 2 + sxy ** 2)
+        out = np.sqrt(np.clip(half_tr - root, 0, None) / (half_tr + root))
+    out[n < min_px] = np.nan
+    return out
+
+
 def spot_colors(result: TrackResult) -> dict[str, tuple]:
     """One colour per spot, shared by the overview figure and the region animation.
 
