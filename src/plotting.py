@@ -57,6 +57,40 @@ def save_figure(fig, plots_dir, filename: str, save: bool = True, dpi: int = 150
     return out
 
 
+def interactive_figure(figsize=(9, 7), **kwargs):
+    """An ipympl (zoom / pan / rotate) figure that leaves the notebook's backend alone.
+
+    `%matplotlib widget` switches pyplot's backend for the whole kernel, and every figure
+    after it is a widget too — including ones drawn by `comparison`, which closes its
+    figures and so leaves widgets without a manager (seaborn then fails on
+    `manager.refresh_all`). This builds the one figure on the ipympl canvas directly, so
+    the cells around it stay inline. Draw on the returned figure, then pass it to
+    `show_interactive`. Not registered with pyplot: use `fig.add_subplot`, not `plt.*`.
+    """
+    import matplotlib
+    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
+
+    # Importing ipympl the first time runs `matplotlib.use('module://ipympl.backend_nbagg')`
+    # (its __init__), which would turn every later figure into a widget. Put it back.
+    backend = matplotlib.get_backend()
+    from ipympl.backend_nbagg import Canvas, FigureManager
+    if matplotlib.get_backend() != backend:
+        plt.switch_backend(backend)
+
+    fig = Figure(figsize=figsize, **kwargs)
+    FigureManager(Canvas(fig), num=-1)   # the manager is what gives the canvas its toolbar
+    return fig
+
+
+def show_interactive(fig) -> None:
+    """Display a figure made by `interactive_figure`."""
+    from IPython.display import display
+
+    fig.canvas.draw_idle()
+    display(fig.canvas)
+
+
 def overlay_mask(ax, mask, region: str | None = None, *, cmap: str | None = None,
                  alpha: float = 0.5, origin: str = 'lower'):
     """Draw a boolean mask as a translucent wash over whatever `ax` already shows.
